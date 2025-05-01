@@ -1,0 +1,40 @@
+[package]
+name = "angry-surgeon-stm32h7"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+critical-section = "1.2.0"
+
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
+embedded-io-async = "0.6.1"
+heapless = "0.8.0"
+micromath = { version = "2.1.0", features = ["num-traits"] }
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+serde = { version = "1.0.219", default-features = false }
+tinyrand = "0.5.0"
+
+[dependencies.embassy-stm32]
+git = "https://github.com/embassy-rs/embassy"
+features = ["stm32h750ib", "time-driver-any", "exti", "memory-x", "unstable-pac"]
+
+[dependencies.embassy-sync]
+git = "https://github.com/embassy-rs/embassy"
+
+[dependencies.embassy-executor]
+git = "https://github.com/embassy-rs/embassy"
+features = ["arch-cortex-m", "executor-thread", "executor-interrupt"]
+
+[dependencies.embassy-time]
+git = "https://github.com/embassy-rs/embassy"
+features = ["defmt-timestamp-uptime", "tick-hz-32_768"]
+
+[dependencies.embassy-futures]
+git = "https://github.com/embassy-rs/embassy"
