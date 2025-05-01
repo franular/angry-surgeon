@@ -4,9 +4,12 @@ use core::future::Future;
 
 use embedded_io_async::{Read, Seek, Write};
 
-pub mod active;
-pub mod pads;
-pub mod passive;
+mod active;
+mod pads;
+mod passive;
+
+pub use pads::{Scene, SceneHandler};
+pub use passive::{Event, Onset, Rd, Wav};
 
 pub const SAMPLE_RATE: u16 = 48000;
 pub const GRAIN_LEN: usize = 1024;

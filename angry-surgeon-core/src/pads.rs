@@ -15,7 +15,7 @@ pub struct Pad<const STEPS: usize> {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Kit<const PADS: usize, const STEPS: usize> {
     #[serde(with = "serde_arrays")]
-    pub inner: [Pad<STEPS>; PADS],
+    pub pads: [Pad<STEPS>; PADS],
 }
 
 impl<const PADS: usize, const STEPS: usize> Kit<PADS, STEPS> {
@@ -25,7 +25,7 @@ impl<const PADS: usize, const STEPS: usize> Kit<PADS, STEPS> {
 
     pub fn new() -> Self {
         Self {
-            inner: core::array::from_fn(|_| Pad::default()),
+            pads: core::array::from_fn(|_| Pad::default()),
         }
     }
 
@@ -36,7 +36,7 @@ impl<const PADS: usize, const STEPS: usize> Kit<PADS, STEPS> {
         pan: f32,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<active::Onset<IO>, IO::Error> {
-        let passive::Onset { wav, start, .. } = self.inner[index.into()].onsets[alt as usize]
+        let passive::Onset { wav, start, .. } = self.pads[index.into()].onsets[alt as usize]
             .as_ref()
             .unwrap();
         let wav = active::Wav {
@@ -60,7 +60,7 @@ impl<const PADS: usize, const STEPS: usize> Kit<PADS, STEPS> {
         pan: f32,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<active::Onset<IO>, IO::Error> {
-        let passive::Onset { wav, start, .. } = self.inner[index.into()].onsets[alt as usize]
+        let passive::Onset { wav, start, .. } = self.pads[index.into()].onsets[alt as usize]
             .as_ref()
             .unwrap();
         let mut wav = active::Wav {
@@ -84,7 +84,7 @@ impl<const PADS: usize, const STEPS: usize> Kit<PADS, STEPS> {
         bias: f32,
         rand: &mut impl Rand,
     ) -> Option<bool> {
-        match self.inner[index.into()].onsets {
+        match self.pads[index.into()].onsets {
             [None, None] => None,
             [Some(_), None] => Some(false),
             [None, Some(_)] => Some(true),
@@ -125,8 +125,8 @@ impl<const BANKS: usize, const PADS: usize, const STEPS: usize> Scene<BANKS, PAD
 }
 
 pub struct Mod<T: Copy + core::ops::Mul> {
-    base: T,
-    offset: T,
+    pub base: T,
+    pub offset: T,
 }
 
 impl<T: Copy + core::ops::Mul> Mod<T> {
@@ -139,10 +139,10 @@ impl<T: Copy + core::ops::Mul> Mod<T> {
     }
 }
 
-pub struct BankHandler<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek> {
-    quant: &'d bool,
-    clock: &'d f32,
-    tempo: &'d f32,
+pub struct BankHandler<const PADS: usize, const STEPS: usize, IO: Read + Write + Seek> {
+    quant: bool,
+    clock: f32,
+    tempo: f32,
 
     pub gain: f32,
     pub speed: Mod<f32>,
@@ -157,14 +157,14 @@ pub struct BankHandler<'d, const PADS: usize, const STEPS: usize, IO: Read + Wri
     pool: active::Pool<IO>,
 }
 
-impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
-    BankHandler<'d, PADS, STEPS, IO>
+impl<const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
+    BankHandler<PADS, STEPS, IO>
 {
-    fn new(quant: &'d bool, clock: &'d f32, tempo: &'d f32) -> Self {
+    fn new() -> Self {
         Self {
-            quant,
-            clock,
-            tempo,
+            quant: false,
+            clock: 0.,
+            tempo: 0.,
 
             gain: 1.,
             speed: Mod::new(1., 1.),
@@ -204,10 +204,10 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
         } else {
             &mut active::Event::Sync
         };
-        if *self.tempo > 0. {
+        if self.tempo > 0. {
             if let active::Event::Hold(onset, ..) = active {
                 return Self::read_grain(
-                    *self.tempo,
+                    self.tempo,
                     self.gain,
                     self.speed.net(),
                     self.width,
@@ -223,7 +223,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                 let len = if let Some(steps) = wav.steps {
                     (f32::from(*len) * wav.len as f32 / steps as f32) as u64 & !1
                 } else {
-                    (f32::from(*len) * super::SAMPLE_RATE as f32 * 60. / *self.tempo
+                    (f32::from(*len) * super::SAMPLE_RATE as f32 * 60. / self.tempo
                         * super::LOOP_DIV as f32) as u64
                         & !1
                 };
@@ -236,7 +236,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                     }
                 }
                 return Self::read_grain(
-                    *self.tempo,
+                    self.tempo,
                     self.gain,
                     self.speed.net(),
                     self.width,
@@ -320,7 +320,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
 
     pub fn assign_reverse(&mut self, reverse: bool) {
         if reverse {
-            self.reverse = Some(*self.clock);
+            self.reverse = Some(self.clock);
         } else {
             self.reverse = None;
         }
@@ -334,12 +334,12 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
         alt: bool,
         onset: passive::Onset,
     ) -> Result<(), IO::Error> {
-        self.kit.inner[index as usize].onsets[alt as usize] = Some(onset);
+        self.kit.pads[index as usize].onsets[alt as usize] = Some(onset);
         self.input
             .active
             .trans(
                 &passive::Event::Hold { index },
-                *self.clock as u16,
+                self.clock as u16,
                 self.bias,
                 rand,
                 &self.kit,
@@ -368,7 +368,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                     active::Event::Hold(onset, step) => {
                         let wav = &mut onset.wav;
                         if let Some(steps) = wav.steps {
-                            let clock = self.reverse.unwrap_or(*self.clock);
+                            let clock = self.reverse.unwrap_or(self.clock);
                             let offset = (wav.len as f32 / steps as f32 * (clock - *step as f32))
                                 as i64
                                 & !1;
@@ -378,7 +378,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                     active::Event::Loop(onset, step, len) => {
                         let wav = &mut onset.wav;
                         if let Some(steps) = wav.steps {
-                            let clock = self.reverse.unwrap_or(*self.clock);
+                            let clock = self.reverse.unwrap_or(self.clock);
                             let offset = (wav.len as f32 / steps as f32
                                 * ((clock - *step as f32).rem_euclid(f32::from(*len))))
                                 as i64
@@ -403,10 +403,6 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
         }
     }
 
-    pub fn offset_speed(&mut self, v: f32) {
-        self.speed.offset = v;
-    }
-
     pub async fn force_event(
         &mut self,
         fs: &mut impl FileHandler<File = IO>,
@@ -415,7 +411,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
     ) -> Result<(), IO::Error> {
         self.input
             .active
-            .trans(&event, *self.clock as u16, self.bias, rand, &self.kit, fs)
+            .trans(&event, self.clock as u16, self.bias, rand, &self.kit, fs)
             .await?;
         Ok(())
     }
@@ -426,7 +422,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
         rand: &mut impl Rand,
         event: passive::Event,
     ) -> Result<(), IO::Error> {
-        if *self.quant {
+        if self.quant {
             self.input.buffer = Some(event);
         } else {
             self.process_input(fs, rand, event).await?;
@@ -437,7 +433,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
     pub fn take_record(&mut self, index: Option<u8>) {
         if let Some((phrase, active)) = self.record.take() {
             if let Some(index) = index {
-                self.kit.inner[index as usize].phrase = Some(phrase);
+                self.kit.pads[index as usize].phrase = Some(phrase);
                 self.pool.next = 1;
                 self.pool.phrases.clear();
                 let _ = self.pool.phrases.push(index);
@@ -454,12 +450,12 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
         len: u16,
     ) -> Result<(), IO::Error> {
         if self.record.active.is_none() {
-            self.record.bake(*self.clock as u16);
+            self.record.bake(self.clock as u16);
         }
         self.record.trim(len);
         self.record
             .generate_phrase(
-                *self.clock as u16,
+                self.clock as u16,
                 self.bias,
                 self.drift,
                 rand,
@@ -490,11 +486,11 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
     ) -> Result<(), IO::Error> {
         self.input
             .active
-            .trans(&event, *self.clock as u16, self.bias, rand, &self.kit, fs)
+            .trans(&event, self.clock as u16, self.bias, rand, &self.kit, fs)
             .await?;
-        self.record.push(event, *self.clock as u16);
+        self.record.push(event, self.clock as u16);
         if let Some(reverse) = &mut self.reverse {
-            *reverse = *self.clock;
+            *reverse = self.clock;
         }
         Ok(())
     }
@@ -518,7 +514,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                 // generate next phrase from record
                 self.record
                     .generate_phrase(
-                        *self.clock as u16,
+                        self.clock as u16,
                         self.bias,
                         self.drift,
                         rand,
@@ -533,7 +529,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                         .generate_stamped(
                             active,
                             *next,
-                            *self.clock as u16,
+                            self.clock as u16,
                             self.bias,
                             self.drift,
                             rand,
@@ -562,7 +558,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                 // generate next phrase from pool
                 self.pool
                     .generate_phrase(
-                        *self.clock as u16,
+                        self.clock as u16,
                         self.bias,
                         self.drift,
                         rand,
@@ -575,13 +571,13 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
                 if let Some(phrase) = self
                     .pool
                     .index
-                    .and_then(|v| self.kit.inner[v as usize].phrase.as_ref())
+                    .and_then(|v| self.kit.pads[v as usize].phrase.as_ref())
                 {
                     if let Some(rem) = phrase
                         .generate_stamped(
                             active,
                             *next,
-                            *self.clock as u16,
+                            self.clock as u16,
                             self.bias,
                             self.drift,
                             rand,
@@ -599,7 +595,7 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
             // generate first phrase from pool
             self.pool
                 .generate_phrase(
-                    *self.clock as u16,
+                    self.clock as u16,
                     self.bias,
                     self.drift,
                     rand,
@@ -612,49 +608,48 @@ impl<'d, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
     }
 }
 
-pub struct SceneHandler<
-    'd,
-    const BANKS: usize,
-    const PADS: usize,
-    const STEPS: usize,
-    IO: Read + Write + Seek,
-> {
+pub struct SceneHandler<const BANKS: usize, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek> {
     pub scene: Scene<BANKS, PADS, STEPS>,
-    pub banks: [BankHandler<'d, PADS, STEPS, IO>; BANKS],
+    pub banks: [BankHandler<PADS, STEPS, IO>; BANKS],
 }
 
-impl<'d, const BANKS: usize, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
-    SceneHandler<'d, BANKS, PADS, STEPS, IO>
+impl<const BANKS: usize, const PADS: usize, const STEPS: usize, IO: Read + Write + Seek>
+    SceneHandler<BANKS, PADS, STEPS, IO>
 {
-    pub fn new(quant: &'d bool, clock: &'d f32, tempo: &'d f32) -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         // oh rust, why won't you let me use generics in const operations
         assert_eq!(STEPS, 2usize.pow(PADS as u32 - 1));
         Self {
             scene: Scene::new(),
-            banks: core::array::from_fn(|_| BankHandler::new(quant, clock, tempo)),
+            banks: core::array::from_fn(|_| BankHandler::new()),
         }
     }
 
     pub async fn tick(
         &mut self,
-        fs: &'d mut impl FileHandler<File = IO>,
-        rand: &'d mut impl Rand,
-        quant: &'d mut bool,
-        clock: &'d mut f32,
+        fs: &mut impl FileHandler<File = IO>,
+        rand: &mut impl Rand,
     ) -> Result<(), IO::Error> {
-        *quant = true;
         for bank in self.banks.iter_mut() {
+            bank.quant = true;
             bank.clock(fs, rand).await?;
+            bank.clock += 1.;
         }
-        *clock += 1.;
         Ok(())
     }
 
-    pub fn stop(&mut self, quant: &'d mut bool, clock: &'d mut f32) {
-        *quant = false;
+    pub fn stop(&mut self) {
         for bank in self.banks.iter_mut() {
+            bank.quant = false;
             bank.stop();
+            bank.clock = 0.;
         }
-        *clock = 0.;
+    }
+
+    pub fn assign_tempo(&mut self, tempo: f32) {
+        for bank in self.banks.iter_mut() {
+            bank.tempo = tempo;
+        }
     }
 }

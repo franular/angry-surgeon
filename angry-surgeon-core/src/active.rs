@@ -260,7 +260,7 @@ impl<IO: Read + Write + Seek> Pool<IO> {
                 self.phrases[index]
             };
             self.index = Some(index);
-            if let Some(phrase) = &kit.inner[index as usize].phrase {
+            if let Some(phrase) = &kit.pads[index as usize].phrase {
                 if let Some(phrase) = phrase
                     .generate_active(&mut self.active, step, bias, drift, rand, kit, fs)
                     .await?
