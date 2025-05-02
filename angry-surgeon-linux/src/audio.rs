@@ -1,3 +1,5 @@
+use crate::input::{STEP_DIV, LOOP_DIV};
+
 use angry_surgeon_core::{Event, FileHandler, Onset, Scene, SceneHandler};
 
 use std::{io::Write, sync::mpsc::Receiver};
@@ -7,8 +9,10 @@ use embedded_io_adapters::futures_03::FromFutures;
 use futures::io::AllowStdIo;
 use tinyrand::Seeded;
 
+pub const SAMPLE_RATE: usize = 48000;
 pub const BANK_COUNT: usize = 2;
 pub const PAD_COUNT: usize = 8;
+pub const MAX_PHRASE_COUNT: usize = 128;
 pub const MAX_PHRASE_LEN: usize = 2usize.pow(PAD_COUNT as u32 - 1);
 
 pub enum Cmd {
@@ -69,7 +73,7 @@ impl FileHandler for LinuxFileHandler {
 
 pub struct AudioHandler {
     rand: tinyrand::Wyrand,
-    scene: SceneHandler<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN, FromFutures<AllowStdIo<std::fs::File>>>,
+    scene: SceneHandler<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN, MAX_PHRASE_COUNT, FromFutures<AllowStdIo<std::fs::File>>>,
     cmd_rx: Receiver<Cmd>,
 }
 
@@ -77,7 +81,8 @@ impl AudioHandler {
     pub fn new(cmd_rx: Receiver<Cmd>) -> Self {
         Self {
             rand: tinyrand::Wyrand::seed(0),
-            scene: SceneHandler::new(),
+            // FIXME: make mutable loop div
+            scene: SceneHandler::new(STEP_DIV as u16, LOOP_DIV as u16),
             cmd_rx,
         }
     }
@@ -126,7 +131,7 @@ impl AudioHandler {
         buffer.fill(T::EQUILIBRIUM);
         let f32_buffer: &mut [f32] = unsafe { core::mem::transmute(buffer) };
         for bank in self.scene.banks.iter_mut() {
-            bank.read_attenuated(f32_buffer, channels).await?;
+            bank.read_attenuated::<SAMPLE_RATE, f32>(f32_buffer, channels).await?;
         }
         Ok(())
     }

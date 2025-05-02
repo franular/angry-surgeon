@@ -1,6 +1,6 @@
 use crate::{audio, tui};
 use audio::{BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN, Bank};
-use angry_surgeon_core::{LOOP_DIV, PPQ, STEP_DIV, Event, Fraction, Onset, Rd, Scene, Wav};
+use angry_surgeon_core::{Event, Fraction, Onset, Rd, Scene, Wav};
 
 use color_eyre::Result;
 use midly::{live::LiveEvent, MidiMessage};
@@ -43,6 +43,10 @@ macro_rules! to_fs_at {
         }
     }
 }
+
+pub const PPQ: u8 = 24;
+pub const STEP_DIV: u8 = 4;
+pub const LOOP_DIV: u8 = 8;
 
 /**
     chords:
@@ -452,17 +456,17 @@ impl InputHandler {
                     self.audio_tx.send(audio::Cmd::SaveScene(file?))?;
                     self.tui_tx.send(tui::Cmd::SaveScene(format!("scenes/scenes{}.sd", index)))?;
                 }
-                GlobalState::LoadScene { paths, file_index } => {
+                GlobalState::LoadScene { paths, file_index } => if !paths.is_empty() {
                     // increment file index
                     *file_index = (*file_index as isize + 1).rem_euclid(paths.len() as isize) as usize;
                     self.tui_tx.send(tui::Cmd::LoadScene(to_fs_at!(paths, *file_index)))?;
                 }
-                GlobalState::LoadWav { paths, file_index } => {
+                GlobalState::LoadWav { paths, file_index } => if !paths.is_empty() {
                     // increment file index
                     *file_index = (*file_index as isize + 1).rem_euclid(paths.len() as isize) as usize;
                     self.tui_tx.send(tui::Cmd::LoadWav(to_fs_at!(paths, *file_index)))?;
                 }
-                GlobalState::AssignOnset { paths, file_index, rd, onset_index, alt } => {
+                GlobalState::AssignOnset { paths, file_index, rd, onset_index, alt } => if !rd.onsets.is_empty() {
                     // increment onset index
                     *onset_index = (*onset_index as isize + 1).rem_euclid(rd.onsets.len() as isize) as usize;
                     let name = paths[*file_index].file_stem().unwrap().to_str().unwrap().to_string();
@@ -580,17 +584,17 @@ impl InputHandler {
                         file_index: 0,
                     };
                 }
-                GlobalState::LoadScene { paths, file_index } => {
+                GlobalState::LoadScene { paths, file_index } => if !paths.is_empty() {
                     // decrement file index
                     *file_index = (*file_index as isize - 1).rem_euclid(paths.len() as isize) as usize;
                     self.tui_tx.send(tui::Cmd::LoadScene(to_fs_at!(paths, *file_index)))?;
                 }
-                GlobalState::LoadWav { paths, file_index } => {
+                GlobalState::LoadWav { paths, file_index } => if !paths.is_empty() {
                     // decrement file index
                     *file_index = (*file_index as isize - 1).rem_euclid(paths.len() as isize) as usize;
                     self.tui_tx.send(tui::Cmd::LoadWav(to_fs_at!(paths, *file_index)))?;
                 }
-                GlobalState::AssignOnset { paths, file_index, rd, onset_index, alt } => {
+                GlobalState::AssignOnset { paths, file_index, rd, onset_index, alt } => if !rd.onsets.is_empty() {
                     // decrement onset index
                     *onset_index = (*onset_index as isize - 1).rem_euclid(rd.onsets.len() as isize) as usize;
                     let name = paths[*file_index].file_stem().unwrap().to_str().unwrap().to_string();
@@ -612,7 +616,7 @@ impl InputHandler {
                         let wav = Wav {
                             tempo: rd.tempo,
                             steps: rd.steps,
-                            path: paths[*file_index].to_str().unwrap().to_string().into_boxed_str(),
+                            path: paths[*file_index].to_str().unwrap().to_string(),
                             len,
                         };
                         let onset = Onset { wav, start };
@@ -636,7 +640,7 @@ impl InputHandler {
                         let wav = Wav {
                             tempo: rd.tempo,
                             steps: rd.steps,
-                            path: paths[*file_index].to_str().unwrap().to_string().into_boxed_str(),
+                            path: paths[*file_index].to_str().unwrap().to_string(),
                             len,
                         };
                         let onset = Onset { wav, start };

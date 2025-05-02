@@ -6,6 +6,10 @@ use embedded_io_async::{Read, Seek, Write};
 use heapless::{Deque, Vec};
 use tinyrand::Rand;
 
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use micromath::F32Ext;
+
 pub struct Wav<IO: Read + Write + Seek> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
@@ -43,13 +47,18 @@ pub enum Event<IO: Read + Write + Seek> {
 }
 
 impl<IO: Read + Write + Seek> Event<IO> {
-    pub async fn trans<const PADS: usize, const N: usize>(
+    pub async fn trans<
+        const PADS: usize,
+        const STEPS: usize,
+        #[cfg(not(feature = "std"))] const PATH: usize,
+    >(
         &mut self,
         input: &passive::Event,
         step: u16,
         bias: f32,
         rand: &mut impl Rand,
-        kit: &pads::Kit<PADS, N>,
+        #[cfg(not(feature = "std"))] kit: &pads::Kit<PADS, STEPS, PATH>,
+        #[cfg(feature = "std")] kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
         match input {
@@ -68,7 +77,13 @@ impl<IO: Read + Write + Seek> Event<IO> {
                     *self = Event::Hold(onset, step);
                 } else if let Some(alt) = kit.generate_alt(*index, bias, rand) {
                     let onset = kit
-                        .onset_seek(*index, alt, pads::Kit::<PADS, N>::generate_pan(*index), fs)
+                        .onset_seek(
+                            *index,
+                            alt,
+                            #[cfg(not(feature = "std"))] pads::Kit::<PADS, STEPS, PATH>::generate_pan(*index),
+                            #[cfg(feature = "std")] pads::Kit::<PADS, STEPS>::generate_pan(*index),
+                            fs,
+                        )
                         .await?;
                     *self = Event::Hold(onset, step);
                 }
@@ -91,7 +106,13 @@ impl<IO: Read + Write + Seek> Event<IO> {
                     _ => {
                         if let Some(alt) = kit.generate_alt(*index, bias, rand) {
                             let onset = kit
-                                .onset(*index, alt, pads::Kit::<PADS, N>::generate_pan(*index), fs)
+                                .onset(
+                                    *index,
+                                    alt,
+                                    #[cfg(not(feature = "std"))] pads::Kit::<PADS, STEPS, PATH>::generate_pan(*index),
+                                    #[cfg(feature = "std")] pads::Kit::<PADS, STEPS>::generate_pan(*index),
+                                    fs,
+                                )
                                 .await?;
                             *self = Event::Loop(onset, step, *len);
                         }
@@ -190,12 +211,18 @@ impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
         self.phrase = Some(passive::Phrase { events, len });
     }
 
-    pub async fn generate_phrase<const PADS: usize>(
+    pub async fn generate_phrase<
+        const PADS: usize,
+        #[cfg(not(feature = "std"))] const PATH: usize,
+    >(
         &mut self,
         step: u16,
         bias: f32,
         drift: f32,
         rand: &mut impl Rand,
+        #[cfg(not(feature = "std"))]
+        kit: &pads::Kit<PADS, STEPS, PATH>,
+        #[cfg(feature = "std")]
         kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
@@ -216,18 +243,18 @@ impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
     }
 }
 
-pub struct Pool<IO: Read + Write + Seek> {
+pub struct Pool<const PHRASES: usize, IO: Read + Write + Seek> {
     /// next phrase index (sans drift)
     pub next: usize,
     /// base phrase sequence
-    pub phrases: Vec<u8, { crate::MAX_POOL_LEN }>,
+    pub phrases: Vec<u8, PHRASES>,
     /// pad index of source phrase, if any
     pub index: Option<u8>,
     /// active phrase, if any
     pub active: Option<Phrase<IO>>,
 }
 
-impl<IO: Read + Write + Seek> Pool<IO> {
+impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
@@ -238,13 +265,20 @@ impl<IO: Read + Write + Seek> Pool<IO> {
         }
     }
 
-    pub async fn generate_phrase<const PADS: usize, const N: usize>(
+    pub async fn generate_phrase<
+        const PADS: usize,
+        const STEPS: usize,
+        #[cfg(not(feature = "std"))] const PATH: usize,
+    >(
         &mut self,
         step: u16,
         bias: f32,
         drift: f32,
         rand: &mut impl Rand,
-        kit: &pads::Kit<PADS, N>,
+        #[cfg(not(feature = "std"))]
+        kit: &pads::Kit<PADS, STEPS, PATH>,
+        #[cfg(feature = "std")]
+        kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
         if self.phrases.is_empty() {

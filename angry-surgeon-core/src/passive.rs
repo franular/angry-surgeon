@@ -2,29 +2,47 @@
 
 use crate::{active, pads, FileHandler};
 
-extern crate alloc;
-use alloc::{boxed::Box, vec::Vec};
 use embedded_io_async::{Read, Seek, Write};
 use tinyrand::Rand;
 
+#[cfg(not(feature = "std"))]
+use heapless::{String, Vec};
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use micromath::F32Ext;
+
+#[cfg(feature = "std")]
+extern crate alloc;
+#[cfg(feature = "std")]
+use alloc::{string::String, vec::Vec};
+
 #[derive(Clone, serde::Deserialize)]
-pub struct Rd {
+pub struct Rd<#[cfg(not(feature = "std"))] const ONSETS: usize> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
+    #[cfg(not(feature = "std"))]
+    pub onsets: Vec<u64, ONSETS>,
+    #[cfg(feature = "std")]
     pub onsets: Vec<u64>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Wav {
+pub struct Wav<#[cfg(not(feature = "std"))] const PATH: usize> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
-    pub path: Box<str>,
+    #[cfg(not(feature = "std"))]
+    pub path: String<PATH>,
+    #[cfg(feature = "std")]
+    pub path: String,
     /// pcm length in bytes
     pub len: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Onset {
+pub struct Onset<#[cfg(not(feature = "std"))] const PATH: usize> {
+    #[cfg(not(feature = "std"))]
+    pub wav: Wav<PATH>,
+    #[cfg(feature = "std")]
     pub wav: Wav,
     pub start: u64,
 }
@@ -50,14 +68,19 @@ pub struct Phrase<const STEPS: usize> {
 
 impl<const STEPS: usize> Phrase<STEPS> {
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_active<const PADS: usize, IO: Read + Write + Seek>(
+    pub async fn generate_active<
+        const PADS: usize,
+        #[cfg(not(feature = "std"))] const PATH: usize,
+        IO: Read + Write + Seek,
+    >(
         &self,
         active: &mut Option<active::Phrase<IO>>,
         step: u16,
         bias: f32,
         drift: f32,
         rand: &mut impl Rand,
-        kit: &pads::Kit<PADS, STEPS>,
+        #[cfg(not(feature = "std"))] kit: &pads::Kit<PADS, STEPS, PATH>,
+        #[cfg(feature = "std")] kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<Option<active::Phrase<IO>>, IO::Error> {
         if let Some(active) = active.as_mut() {
@@ -110,7 +133,11 @@ impl<const STEPS: usize> Phrase<STEPS> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_stamped<const PADS: usize, IO: Read + Write + Seek>(
+    pub async fn generate_stamped<
+        const PADS: usize,
+        #[cfg(not(feature = "std"))] const PATH: usize,
+        IO: Read + Write + Seek,
+    >(
         &self,
         active: &mut active::Event<IO>,
         index: usize,
@@ -118,7 +145,8 @@ impl<const STEPS: usize> Phrase<STEPS> {
         bias: f32,
         drift: f32,
         rand: &mut impl Rand,
-        kit: &pads::Kit<PADS, STEPS>,
+        #[cfg(not(feature = "std"))] kit: &pads::Kit<PADS, STEPS, PATH>,
+        #[cfg(feature = "std")] kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<Option<u16>, IO::Error> {
         let drift =

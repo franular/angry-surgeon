@@ -1,9 +1,11 @@
 [package]
-name = "angry-surgeon-stm32h7"
+name = "angry-surgeon-daisy"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+angry-surgeon-core = { path = "../angry-surgeon-core" }
+
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
 critical-section = "1.2.0"

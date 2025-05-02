@@ -1,7 +1,8 @@
 #![no_std]
 
+#[cfg(feature = "std")]
+extern crate alloc;
 use core::future::Future;
-
 use embedded_io_async::{Read, Seek, Write};
 
 mod active;
@@ -11,14 +12,7 @@ mod passive;
 pub use pads::{Scene, SceneHandler};
 pub use passive::{Event, Onset, Rd, Wav};
 
-pub const SAMPLE_RATE: u16 = 48000;
 pub const GRAIN_LEN: usize = 1024;
-
-pub const PPQ: u8 = 24;
-pub const STEP_DIV: u8 = 4;
-pub const LOOP_DIV: u8 = 8;
-
-pub const MAX_POOL_LEN: usize = 128;
 
 pub trait FileHandler {
     type File: Read + Write + Seek;

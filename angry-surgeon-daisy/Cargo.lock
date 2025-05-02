@@ -12,9 +12,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "angry-surgeon-stm32h7"
+name = "angry-surgeon-core"
 version = "0.1.0"
 dependencies = [
+ "embedded-io-async",
+ "heapless",
+ "serde",
+ "serde_arrays",
+ "tinyrand",
+]
+
+[[package]]
+name = "angry-surgeon-daisy"
+version = "0.1.0"
+dependencies = [
+ "angry-surgeon-core",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
@@ -542,6 +554,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
+ "serde",
  "stable_deref_trait",
 ]
 
@@ -695,6 +708,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde_arrays"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94a16b99c5ea4fe3daccd14853ad260ec00ea043b2708d1fd1da3106dcd8d9df"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
