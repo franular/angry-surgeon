@@ -9,10 +9,10 @@ mod active;
 mod pads;
 mod passive;
 
-pub use pads::{Scene, SceneHandler};
-pub use passive::{Event, Onset, Rd, Wav};
+pub use pads::{SceneHandler, Sd};
+pub use passive::{Event, Onset, Phrase, Rd, Wav};
 
-pub const GRAIN_LEN: usize = 1024;
+pub const GRAIN_LEN: usize = 512;
 
 pub trait FileHandler {
     type File: Read + Write + Seek;
@@ -20,24 +20,22 @@ pub trait FileHandler {
     fn open(
         &mut self,
         path: &str,
-    ) -> impl Future<Output = Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error>>
-           + Send;
+    ) -> impl Future<Output = Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error>>;
 
     fn try_clone(
         &mut self,
         file: &Self::File,
-    ) -> impl Future<Output = Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error>>
-           + Send;
+    ) -> impl Future<Output = Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error>>;
 }
 
 #[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Fraction {
-    numerator: u8,
-    denominator: u8,
+    numerator: u16,
+    denominator: u16,
 }
 
 impl Fraction {
-    pub fn new(numerator: u8, denominator: u8) -> Self {
+    pub fn new(numerator: u16, denominator: u16) -> Self {
         Self {
             numerator,
             denominator,

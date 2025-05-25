@@ -15,20 +15,22 @@ pub const PAD_COUNT: usize = 8;
 pub const MAX_PHRASE_COUNT: usize = 128;
 pub const MAX_PHRASE_LEN: usize = 2usize.pow(PAD_COUNT as u32 - 1);
 
+pub type File = <LinuxFileHandler as FileHandler>::File;
+
+#[derive(Copy, Clone)]
+pub enum Bank {
+    A,
+    B,
+}
+
 pub enum Cmd {
     Clock,
     Stop,
     AssignTempo(f32),
     OffsetSpeed(f32),
     SaveScene(std::fs::File),
-    LoadScene(Box<Scene<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN>>),
+    LoadScene(Box<Scene<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN, File>>),
     Bank(Bank, BankCmd),
-}
-
-#[derive(Copy, Clone)]
-pub enum Bank {
-    A,
-    B,
 }
 
 pub enum BankCmd {
@@ -41,7 +43,7 @@ pub enum BankCmd {
 
     AssignKit(u8),
     LoadKit(u8),
-    AssignOnset(u8, bool, Box<Onset>),
+    AssignOnset(u8, bool, Box<Onset<File>>),
 
     ForceEvent(Event),
     PushEvent(Event),
@@ -55,13 +57,6 @@ pub struct LinuxFileHandler;
 
 impl FileHandler for LinuxFileHandler {
     type File = FromFutures<AllowStdIo<std::fs::File>>;
-
-    async fn open(
-        &mut self,
-        path: &str,
-    ) -> Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error> {
-        Ok(FromFutures::new(AllowStdIo::new(std::fs::File::open(path)?)))
-    }
 
     async fn try_clone(
         &mut self,

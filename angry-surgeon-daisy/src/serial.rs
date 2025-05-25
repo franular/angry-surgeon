@@ -26,15 +26,15 @@ macro_rules! print {
                 i += 1;
             }
         }
-        // $crate::serial::CHANNEL.send(buf).await;
-        let _ = $crate::serial::CHANNEL.try_send(buf);
+        $crate::serial::CHANNEL.send(buf).await;
+        // let _ = $crate::serial::CHANNEL.try_send(buf);
     };
-    ($str:expr) => {
+    ($str:expr) => {{
         let mut buf = [0u8; 64];
         buf[..$str.len()].copy_from_slice($str.as_bytes());
-        // $crate::serial::CHANNEL.send(buf).await;
-        let _ = $crate::serial::CHANNEL.try_send(buf);
-    };
+        $crate::serial::CHANNEL.send(buf).await;
+        // let _ = $crate::serial::CHANNEL.try_send(buf);
+    }};
 }
 
 pub static CHANNEL: embassy_sync::channel::Channel<RawMutex, [u8; 64], 8> =
@@ -114,19 +114,20 @@ pub async fn serial(
     rx: embassy_sync::channel::DynamicReceiver<'static, Message>,
 ) {
     let usb_fut = usb.run();
-    let mut serial_fut = async || -> Result<(), Disconnected> {
+    let serial_fut = async {
         class.wait_connection().await;
         let mut buf = [0; 64];
         // wait for input before sending first message
-        let _ = class.read_packet(&mut buf).await?;
+        let _ = class.read_packet(&mut buf).await.unwrap();
         class
             .write_packet("serial connected!\r\n".as_bytes())
-            .await?;
+            .await
+            .unwrap();
         loop {
             let msg = rx.receive().await;
-            class.write_packet(&msg).await?;
-            class.write_packet("\r\n".as_bytes()).await?;
+            class.write_packet(&msg).await.unwrap();
+            class.write_packet("\r\n".as_bytes()).await.unwrap();
         }
     };
-    embassy_futures::join::join(usb_fut, serial_fut()).await;
+    embassy_futures::join::join(usb_fut, serial_fut).await;
 }

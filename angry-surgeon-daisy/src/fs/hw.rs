@@ -1,3 +1,4 @@
+use angry_surgeon_core::FileHandler;
 use embassy_stm32::sdmmc::Error as SdmmcError;
 use embassy_stm32::sdmmc::{
     CkPin, CmdPin, D0Pin, D1Pin, D2Pin, D3Pin, Instance, InterruptHandler, Sdmmc,
@@ -5,13 +6,29 @@ use embassy_stm32::sdmmc::{
 use embassy_stm32::Peri;
 
 use block_device_adapters::{BufStream, BufStreamError, StreamSlice, StreamSliceError};
-use embedded_fatfs::Error as FatfsError;
-use embedded_fatfs::{Dir, OemCpConverter, ReadWriteSeek, TimeProvider};
 use embedded_io_async::{Read, ReadExactError, Seek, SeekFrom};
-use heapless::String;
 
-pub const MAX_PATH_LEN: usize = 256;
 pub const FILE_COUNT: usize = 5;
+
+type BlockDevice<'d> = StreamSlice<BufStream<Sdmmc<'d, embassy_stm32::peripherals::SDMMC1>, 512>>;
+pub type FileSystem<'d> = embedded_fatfs::FileSystem<
+    BlockDevice<'d>,
+    embedded_fatfs::DefaultTimeProvider,
+    embedded_fatfs::LossyOemCpConverter,
+>;
+pub type File<'d> = embedded_fatfs::File<
+    'd,
+    BlockDevice<'d>,
+    embedded_fatfs::DefaultTimeProvider,
+    embedded_fatfs::LossyOemCpConverter,
+>;
+pub type Dir<'d> = embedded_fatfs::Dir<
+    'd,
+    BlockDevice<'d>,
+    embedded_fatfs::DefaultTimeProvider,
+    embedded_fatfs::LossyOemCpConverter,
+>;
+pub type Error<'d> = <File<'d> as embedded_io_async::ErrorType>::Error;
 
 // pub async fn paths_recursive<'d, IO, TP, OCC>(
 //     dir: &Dir<'d, IO, TP, OCC>,
@@ -49,25 +66,53 @@ pub const FILE_COUNT: usize = 5;
 //     Ok(children)
 // }
 
+pub struct SdmmcFileHandler<'d> {
+    root: Dir<'d>,
+}
+
+impl<'d> SdmmcFileHandler<'d> {
+    pub fn new(root: Dir<'d>) -> Self {
+        Self { root }
+    }
+}
+
+impl<'d> FileHandler for SdmmcFileHandler<'d> {
+    type File = File<'d>;
+
+    async fn open(
+        &mut self,
+        path: &str,
+    ) -> Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error> {
+        self.root.open_file(path).await
+    }
+
+    async fn try_clone(
+        &mut self,
+        file: &Self::File,
+    ) -> Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error> {
+        Ok(file.clone())
+    }
+}
+
 #[derive(Debug)]
-pub enum Error {
+pub enum InitError {
     ReadExact(ReadExactError<BufStreamError<SdmmcError>>),
     StreamSlice(StreamSliceError<BufStreamError<SdmmcError>>),
 }
 
-impl From<BufStreamError<SdmmcError>> for Error {
+impl From<BufStreamError<SdmmcError>> for InitError {
     fn from(value: BufStreamError<SdmmcError>) -> Self {
         Self::StreamSlice(value.into())
     }
 }
 
-impl From<ReadExactError<BufStreamError<SdmmcError>>> for Error {
+impl From<ReadExactError<BufStreamError<SdmmcError>>> for InitError {
     fn from(value: ReadExactError<BufStreamError<SdmmcError>>) -> Self {
         Self::ReadExact(value)
     }
 }
 
-impl From<StreamSliceError<BufStreamError<SdmmcError>>> for Error {
+impl From<StreamSliceError<BufStreamError<SdmmcError>>> for InitError {
     fn from(value: StreamSliceError<BufStreamError<SdmmcError>>) -> Self {
         Self::StreamSlice(value)
     }
@@ -83,7 +128,7 @@ pub async fn init_sdmmc<'d, T: Instance>(
     d1: Peri<'d, impl D1Pin<T>>,
     d2: Peri<'d, impl D2Pin<T>>,
     d3: Peri<'d, impl D3Pin<T>>,
-) -> Result<StreamSlice<BufStream<Sdmmc<'d, T>, 512>>, Error> {
+) -> Result<StreamSlice<BufStream<Sdmmc<'d, T>, 512>>, InitError> {
     let mut sdmmc = Sdmmc::new_4bit(instance, _irq, clk, cmd, d0, d1, d2, d3, Default::default());
     sdmmc
         .init_sd_card(embassy_stm32::time::Hertz::mhz(25))

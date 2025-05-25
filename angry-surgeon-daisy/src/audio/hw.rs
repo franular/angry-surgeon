@@ -1,12 +1,11 @@
 use embassy_stm32::{
     peripherals::SAI1,
-    sai::{Dma, FsPin, Instance, MasterClockDivider, MclkPin, Sai, SckPin, SdPin, A, B},
+    sai::{Dma, FsPin, Instance, MasterClockDivider, MclkPin, Sai, SckPin, SdPin, A},
     Peri,
 };
 use grounded::uninit::GroundedArrayCell;
 
-const BLOCK_LEN: usize = 32; // samples per channel
-pub(super) const HALF_DMA_BUFFER_LEN: usize = BLOCK_LEN * 2; // 2 channels
+pub(super) const HALF_DMA_BUFFER_LEN: usize = super::GRAIN_LEN * 2; // 2 channels
 const DMA_BUFFER_LEN: usize = HALF_DMA_BUFFER_LEN * 2;
 
 #[link_section = ".sram1_bss"]
@@ -14,18 +13,15 @@ static TX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LEN> = GroundedArrayCell::un
 #[link_section = ".sram1_bss"]
 static RX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LEN> = GroundedArrayCell::uninit();
 
-#[allow(clippy::too_many_arguments)]
-pub fn init_sai_tx_rx<'d, T: Instance>(
+pub fn init_sai_tx<'d, T: Instance>(
     instance: Peri<'d, T>,
     sck: Peri<'d, impl SckPin<T, A>>,
     fs: Peri<'d, impl FsPin<T, A>>,
     mclk: Peri<'d, impl MclkPin<T, A>>,
-    sd_tx: Peri<'d, impl SdPin<T, A>>,
-    sd_rx: Peri<'d, impl SdPin<T, B>>,
-    dma_tx: Peri<'d, impl Dma<T, A>>,
-    dma_rx: Peri<'d, impl Dma<T, B>>,
-) -> (Sai<'d, T, u32>, Sai<'d, T, u32>) {
-    let (sub_block_tx, sub_block_rx) = embassy_stm32::sai::split_subblocks(instance);
+    sd: Peri<'d, impl SdPin<T, A>>,
+    dma: Peri<'d, impl Dma<T, A>>,
+) -> Sai<'d, T, u32> {
+    let (sub_block_tx, _) = embassy_stm32::sai::split_subblocks(instance);
     let tx_config = {
         use embassy_stm32::sai::*;
 
@@ -39,7 +35,7 @@ pub fn init_sai_tx_rx<'d, T: Instance>(
         config.clock_strobe = ClockStrobe::Falling;
         config.master_clock_divider = mclk_div_from_u8(mclk_div);
         config.stereo_mono = StereoMono::Stereo;
-        config.data_size = DataSize::Data24;
+        config.data_size = DataSize::Data16;
         config.bit_order = BitOrder::MsbFirst;
         config.frame_sync_polarity = FrameSyncPolarity::ActiveHigh;
         config.frame_sync_offset = FrameSyncOffset::OnFirstBit;
@@ -48,39 +44,13 @@ pub fn init_sai_tx_rx<'d, T: Instance>(
         config.fifo_threshold = FifoThreshold::Quarter;
         config
     };
-    let rx_config = {
-        use embassy_stm32::sai::*;
-
-        let mut config = tx_config;
-        config.mode = Mode::Slave;
-        config.tx_rx = TxRx::Receiver;
-        config.sync_output = false;
-        config.sync_input = SyncInput::Internal;
-        config.clock_strobe = ClockStrobe::Rising;
-        config
-    };
     let tx_buffer: &mut [u32] = unsafe {
         TX_BUFFER.initialize_all_copied(0);
         let (ptr, len) = TX_BUFFER.get_ptr_len();
         core::slice::from_raw_parts_mut(ptr, len)
     };
-    let rx_buffer: &mut [u32] = unsafe {
-        RX_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = RX_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
-    let tx = Sai::new_asynchronous_with_mclk(
-        sub_block_tx,
-        sck,
-        sd_tx,
-        fs,
-        mclk,
-        dma_tx,
-        tx_buffer,
-        tx_config,
-    );
-    let rx = Sai::new_synchronous(sub_block_rx, sd_rx, dma_rx, rx_buffer, rx_config);
-    (tx, rx)
+
+    Sai::new_asynchronous_with_mclk(sub_block_tx, sck, sd, fs, mclk, dma, tx_buffer, tx_config)
 }
 
 const fn mclk_div_from_u8(v: u8) -> MasterClockDivider {

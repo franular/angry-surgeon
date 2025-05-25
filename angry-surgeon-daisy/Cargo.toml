@@ -13,6 +13,7 @@ critical-section = "1.2.0"
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
 
+block-device-adapters = "0.2.0"
 block-device-driver = "0.2.0"
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
@@ -22,10 +23,12 @@ grounded = "0.2.0"
 heapless = "0.8.0"
 micromath = { version = "2.1.0", features = ["num-traits"] }
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+postcard = { version = "1.1.1", features = ["alloc"] }
 serde = { version = "1.0.219", default-features = false }
+ssd1306 = { version = "0.10.0", features = ["async"] }
 static_cell = "2.1.0"
 tinyrand = "0.5.0"
-block-device-adapters = "0.2.0"
+embedded-alloc = "0.6.0"
 
 # tell rust-analyzer not to expect test crate
 [[bin]]
@@ -47,6 +50,10 @@ features = ["stm32h750ib", "time-driver-tim5", "exti", "memory-x", "unstable-pac
 
 [dependencies.embassy-sync]
 # path = "../embassy/embassy-sync"
+git = "https://github.com/embassy-rs/embassy"
+
+[dependencies.embassy-embedded-hal]
+# path = "../embassy/embassy-embedded-hal"
 git = "https://github.com/embassy-rs/embassy"
 
 [dependencies.embassy-executor]

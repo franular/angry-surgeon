@@ -47,18 +47,15 @@ pub enum Event<IO: Read + Write + Seek> {
 }
 
 impl<IO: Read + Write + Seek> Event<IO> {
-    pub async fn trans<
-        const PADS: usize,
-        const STEPS: usize,
-        #[cfg(not(feature = "std"))] const PATH: usize,
-    >(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn trans<const PADS: usize, const STEPS: usize>(
         &mut self,
         input: &passive::Event,
         step: u16,
-        bias: f32,
+        bank: &pads::Bank<PADS, STEPS>,
+        kit_index: usize,
+        kit_drift: f32,
         rand: &mut impl Rand,
-        #[cfg(not(feature = "std"))] kit: &pads::Kit<PADS, STEPS, PATH>,
-        #[cfg(feature = "std")] kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
         match input {
@@ -75,17 +72,14 @@ impl<IO: Read + Write + Seek> Event<IO> {
                     // i don't know either, girl
                     onset.wav.file = fs.try_clone(&onset.wav.file).await?;
                     *self = Event::Hold(onset, step);
-                } else if let Some(alt) = kit.generate_alt(*index, bias, rand) {
-                    let onset = kit
-                        .onset_seek(
-                            *index,
-                            alt,
-                            #[cfg(not(feature = "std"))] pads::Kit::<PADS, STEPS, PATH>::generate_pan(*index),
-                            #[cfg(feature = "std")] pads::Kit::<PADS, STEPS>::generate_pan(*index),
-                            fs,
-                        )
-                        .await?;
-                    *self = Event::Hold(onset, step);
+                } else {
+                    let kit = bank.generate_kit(kit_index, kit_drift, rand);
+                    if let Some(onset) = kit
+                        .onset_seek(*index, pads::Kit::<PADS>::generate_pan(*index), fs)
+                        .await?
+                    {
+                        *self = Event::Hold(onset, step);
+                    }
                 }
             }
             passive::Event::Loop { index, len } => {
@@ -104,16 +98,11 @@ impl<IO: Read + Write + Seek> Event<IO> {
                         *self = Event::Loop(onset, *step, *len);
                     }
                     _ => {
-                        if let Some(alt) = kit.generate_alt(*index, bias, rand) {
-                            let onset = kit
-                                .onset(
-                                    *index,
-                                    alt,
-                                    #[cfg(not(feature = "std"))] pads::Kit::<PADS, STEPS, PATH>::generate_pan(*index),
-                                    #[cfg(feature = "std")] pads::Kit::<PADS, STEPS>::generate_pan(*index),
-                                    fs,
-                                )
-                                .await?;
+                        let kit = bank.generate_kit(kit_index, kit_drift, rand);
+                        if let Some(onset) = kit
+                            .onset(*index, pads::Kit::<PADS>::generate_pan(*index), fs)
+                            .await?
+                        {
                             *self = Event::Loop(onset, step, *len);
                         }
                     }
@@ -211,24 +200,29 @@ impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
         self.phrase = Some(passive::Phrase { events, len });
     }
 
-    pub async fn generate_phrase<
-        const PADS: usize,
-        #[cfg(not(feature = "std"))] const PATH: usize,
-    >(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_phrase<const PADS: usize>(
         &mut self,
         step: u16,
-        bias: f32,
-        drift: f32,
+        bank: &pads::Bank<PADS, STEPS>,
+        kit_index: usize,
+        kit_drift: f32,
+        phrase_drift: f32,
         rand: &mut impl Rand,
-        #[cfg(not(feature = "std"))]
-        kit: &pads::Kit<PADS, STEPS, PATH>,
-        #[cfg(feature = "std")]
-        kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
         if let Some(phrase) = self.phrase.as_mut() {
             if let Some(phrase) = phrase
-                .generate_active(&mut self.active, step, bias, drift, rand, kit, fs)
+                .generate_active(
+                    &mut self.active,
+                    step,
+                    bank,
+                    kit_index,
+                    kit_drift,
+                    phrase_drift,
+                    rand,
+                    fs,
+                )
                 .await?
             {
                 self.active = Some(phrase);
@@ -265,20 +259,15 @@ impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
         }
     }
 
-    pub async fn generate_phrase<
-        const PADS: usize,
-        const STEPS: usize,
-        #[cfg(not(feature = "std"))] const PATH: usize,
-    >(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_phrase<const PADS: usize, const STEPS: usize>(
         &mut self,
         step: u16,
-        bias: f32,
-        drift: f32,
+        bank: &pads::Bank<PADS, STEPS>,
+        kit_index: usize,
+        kit_drift: f32,
+        phrase_drift: f32,
         rand: &mut impl Rand,
-        #[cfg(not(feature = "std"))]
-        kit: &pads::Kit<PADS, STEPS, PATH>,
-        #[cfg(feature = "std")]
-        kit: &pads::Kit<PADS, STEPS>,
         fs: &mut impl FileHandler<File = IO>,
     ) -> Result<(), IO::Error> {
         if self.phrases.is_empty() {
@@ -288,15 +277,24 @@ impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
             let index = {
                 // FIXME: use independent phrase_drift instead of same "stamped_drift"?
                 let drift = rand.next_lim_usize(
-                    ((drift * self.phrases.len() as f32 - 1.).round()) as usize + 1,
+                    ((phrase_drift * self.phrases.len() as f32 - 1.).round()) as usize + 1,
                 );
                 let index = (self.next + drift) % self.phrases.len();
                 self.phrases[index]
             };
             self.index = Some(index);
-            if let Some(phrase) = &kit.pads[index as usize].phrase {
+            if let Some(phrase) = &bank.phrases[index as usize] {
                 if let Some(phrase) = phrase
-                    .generate_active(&mut self.active, step, bias, drift, rand, kit, fs)
+                    .generate_active(
+                        &mut self.active,
+                        step,
+                        bank,
+                        kit_index,
+                        kit_drift,
+                        phrase_drift,
+                        rand,
+                        fs,
+                    )
                     .await?
                 {
                     self.active = Some(phrase);
