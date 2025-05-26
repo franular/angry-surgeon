@@ -29,6 +29,8 @@ ssd1306 = { version = "0.10.0", features = ["async"] }
 static_cell = "2.1.0"
 tinyrand = "0.5.0"
 embedded-alloc = "0.6.0"
+embedded-graphics = "0.8.1"
+ibm437 = { version = "0.3.3", default-features = false, features = ["regular8x8"] }
 
 # tell rust-analyzer not to expect test crate
 [[bin]]

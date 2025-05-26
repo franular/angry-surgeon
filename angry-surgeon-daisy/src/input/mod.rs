@@ -1,9 +1,10 @@
+use core::str::FromStr;
+
 use crate::{
     audio::{self, BANK_COUNT, MAX_PHRASE_LEN, PAD_COUNT},
     fs::hw::Dir,
     tui,
 };
-use alloc::string::ToString;
 use angry_surgeon_core::{Event, Fraction, Onset, Wav};
 use embassy_stm32::gpio::Level;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::DynamicSender};
@@ -32,6 +33,39 @@ macro_rules! tui_bank_cmd {
     };
 }
 
+macro_rules! log {
+    ($tx:expr,$($arg:tt)*) => {
+        let text = heapless::String::from_str(&alloc::format!($($arg)*)).unwrap();
+        $tx.send(tui::Cmd::Log(text)).await;
+    }
+}
+
+macro_rules! names {
+    ($dir:expr,$ext:expr) => {{
+        let mut names = alloc::vec::Vec::new();
+        let mut iter = $dir.iter();
+        while let Some(Ok(entry)) = iter.next().await {
+            let name =
+                alloc::string::String::from_utf16(entry.long_file_name_as_ucs2_units().unwrap())
+                    .unwrap();
+            if entry.is_dir() || name.ends_with($ext) {
+                names.push(name);
+            }
+        }
+        names
+    }};
+}
+
+async fn ancestors(path: &mut alloc::string::String, parent: &Dir<'_>) {
+    if let Ok(entry) = parent.open_meta("..").await {
+        alloc::boxed::Box::pin(ancestors(path, &entry.to_dir())).await;
+        path.push_str(
+            &alloc::string::String::from_utf16(entry.long_file_name_as_ucs2_units().unwrap())
+                .unwrap(),
+        );
+    }
+}
+
 pub type Sd<'d> = angry_surgeon_core::Sd<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN>;
 
 // mpr121 electrode index of modifiers
@@ -50,20 +84,17 @@ enum GlobalState<'d> {
     LoadScene {
         dir: Dir<'d>,
         file_index: usize,
-        file_count: usize,
-        path: alloc::string::String,
+        names: alloc::vec::Vec<alloc::string::String>,
     },
     LoadWav {
         dir: Dir<'d>,
         file_index: usize,
-        file_count: usize,
-        path: alloc::string::String,
+        names: alloc::vec::Vec<alloc::string::String>,
     },
     AssignOnset {
         dir: Dir<'d>,
         file_index: usize,
-        file_count: usize,
-        path: alloc::string::String,
+        name: alloc::string::String,
         rd: angry_surgeon_core::Rd,
         onset_index: usize,
     },
@@ -190,7 +221,7 @@ impl BankHandler {
             if self.shift {
                 // init build pool
                 self.state = BankState::BuildPool { cleared: false };
-                tui_tx.send(tui_bank_cmd!(self.bank, BuildPool)).await;
+                tui_tx.send(tui_bank_cmd!(self.bank, PushPool, None)).await;
             } else {
                 self.hold = !self.hold;
                 if !self.hold && self.downs.is_empty() {
@@ -318,7 +349,18 @@ impl BankHandler {
                     tui_tx.send(tui_bank_cmd!(self.bank, ClearPool)).await;
                 }
                 audio_tx
-                    .send(audio_bank_cmd!(self.bank, PushPool, self.downs[0]))
+                    .send(audio_bank_cmd!(
+                        self.bank,
+                        PushPool,
+                        *self.downs.last().unwrap()
+                    ))
+                    .await;
+                tui_tx
+                    .send(tui_bank_cmd!(
+                        self.bank,
+                        PushPool,
+                        self.downs.last().copied()
+                    ))
                     .await;
             }
         }
@@ -409,85 +451,6 @@ impl<'d> InputHandler<'d> {
             *index += 1;
         }
     }
-
-    // async fn load_scene(&self, source: Scene<'d>) -> Result<Scene<'d>, crate::fs::hw::Error<'d>> {
-    //     let mut scene = angry_surgeon_core::Scene::default();
-    //     for (rbank, wbank) in source.banks.into_iter().zip(scene.banks.iter_mut()) {
-    //         for (rpad, wpad) in rbank.pads.into_iter().zip(wbank.pads.iter_mut()) {
-    //             for (rgroup, wgroup) in rpad.kit.onsets.into_iter().zip(wpad.kit.onsets.iter_mut()) {
-    //                 for (ronset, wonset) in rgroup.into_iter().zip(wgroup.iter_mut()) {
-    //                     if let Some(ronset) = ronset {
-    //                         let len = self.root.open_meta(&ronset.wav.path).await.unwrap().len() - 44;
-    //                         // parse rd
-    //                         let path = ronset.wav.path.strip_suffix("wav").unwrap().to_string() + "rd";
-    //                         if let Ok(mut rd_file) = self.root.open_file(&path).await {
-    //                             let mut reader = crate::fs::BufReader::new(&mut rd_file);
-    //                             let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    //                             while let Ok(Some(c)) = reader.next().await {
-    //                                 bytes.push(c);
-    //                             }
-    //                             if let Ok(rd) = postcard::from_bytes::<angry_surgeon_core::Rd>(&bytes[..]) {
-    //                                 *wonset = Some(Onset {
-    //                                     wav: Wav {
-    //                                         tempo: rd.tempo,
-    //                                         steps: rd.steps,
-    //                                         path: ronset.wav.path,
-    //                                         len,
-    //                                     },
-    //                                     start: ronset.start,
-    //                                 });
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //             wpad.phrase = rpad.phrase;
-    //         }
-    //     }
-    //     Ok(scene)
-    // }
-
-    // async fn save_scene(&self, scene: Scene<'d>) -> Result<, crate::fs::hw::Error<'d>> {
-    //     let mut sd = crate::fs::Sd::default();
-    //     for (rbank, wbank) in scene.banks.into_iter().zip(sd.banks.iter_mut()) {
-    //         for (rpad, wpad) in rbank.pads.into_iter().zip(wbank.pads.iter_mut()) {
-    //             for (rgroup, wgroup) in rpad.kit.onsets.into_iter().zip(wpad.kit.onsets.iter_mut()) {
-    //                 for (ronset, wonset) in rgroup.into_iter().zip(wgroup.iter_mut()) {
-    //                     if let Some(ronset) = ronset {
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     Ok(sd)
-    // }
-
-    // async fn entry_open(dir: &Dir<'d>, mut index: usize, count: usize) -> Result<(), Error<'d>> {
-    //     let mut iter = dir.iter();
-    //     while let Some(Ok(entry)) = iter.next().await {
-    //         let name = core::str::from_utf8(entry.short_file_name_as_bytes()).unwrap();
-    //         if entry.is_dir() {
-    //             index += 1;
-    //             if index == count {
-    //                 return Ok(Entry::Dir(entry.to_dir()));
-    //             }
-    //         } else if entry.is_file() && name.ends_with("RD\0") {
-    //             index += 1;
-    //             if index == count {
-    //                 let mut file = entry.to_file();
-    //                 let mut reader = crate::fs::BufReader::new(&mut file);
-    //                 let mut parser = crate::fs::RdParser::new();
-    //                 while let Some(c) = reader.next().await? {
-    //                     parser.parse(c);
-    //                 }
-    //                 let rd = parser.take();
-    //                 return Ok(Entry::Rd(rd))
-    //             }
-    //         }
-    //     }
-    //     // FIXME: actually return dir or rd data
-    //     Ok(())
-    // }
 }
 
 #[embassy_executor::task]
@@ -551,6 +514,11 @@ pub async fn input(
                                 .await
                                 .unwrap();
                             sd_file.write_all(&bytes).await.unwrap();
+
+                            let name =
+                                heapless::String::from_str(&alloc::format!("scene{}", index))
+                                    .unwrap();
+                            tui_tx.send(tui::Cmd::Log(name));
                         }
                     } else {
                         // load scene
@@ -558,72 +526,49 @@ pub async fn input(
                             GlobalState::LoadScene {
                                 ref dir,
                                 file_index,
-                                ref path,
+                                ref names,
                                 ..
                             } => {
-                                // find entry
-                                let mut iter = dir.iter();
-                                let mut i = 0;
-                                while let Some(Ok(entry)) = iter.next().await {
-                                    let name = alloc::string::String::from_utf16(
-                                        entry.long_file_name_as_ucs2_units().unwrap(),
-                                    )
-                                    .unwrap();
+                                if let Ok(entry) = dir.open_meta(&names[file_index]).await {
                                     if entry.is_dir() {
-                                        i += 1;
-                                        if i == file_index {
-                                            // open found dir
-                                            let dir = entry.to_dir();
-                                            let file_count = InputHandler::file_count(&dir).await;
-                                            let path = if name == ".." {
-                                                path.rsplit_once('/').unwrap().0.to_string()
-                                            } else {
-                                                path.clone() + "/" + &name
-                                            };
-                                            input.state = GlobalState::LoadScene {
-                                                dir,
-                                                file_index: 0,
-                                                file_count,
-                                                path,
-                                            };
-                                            break;
+                                        let dir = entry.to_dir();
+                                        let names = names!(dir, ".sd");
+                                        input.state = GlobalState::LoadScene {
+                                            dir,
+                                            file_index: 0,
+                                            names,
+                                        };
+                                    } else if entry.is_file() && names[file_index].ends_with(".sd")
+                                    {
+                                        // load sd
+                                        let mut sd_file = entry.to_file();
+                                        let mut reader = crate::fs::BufReader::new(&mut sd_file);
+                                        let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                        while let Ok(Some(c)) = reader.next().await {
+                                            bytes.push(c);
                                         }
-                                    } else if entry.is_file() && name.ends_with(".sd") {
-                                        i += 1;
-                                        if i == file_index {
-                                            // load found scene
-                                            let mut sd_file = entry.to_file();
-                                            let mut reader =
-                                                crate::fs::BufReader::new(&mut sd_file);
-                                            let mut bytes: alloc::vec::Vec<u8> =
-                                                alloc::vec::Vec::new();
-                                            while let Ok(Some(c)) = reader.next().await {
-                                                bytes.push(c);
-                                            }
-                                            if let Ok(sd) = postcard::from_bytes::<Sd>(&bytes) {
-                                                scene_ch.send(sd).await;
-                                                audio_tx
-                                                    .send(crate::audio::Cmd::LoadScene(
-                                                        scene_ch.dyn_receiver(),
-                                                    ))
-                                                    .await;
-                                            }
-                                            break;
+                                        if let Ok(sd) = postcard::from_bytes::<Sd>(&bytes) {
+                                            scene_ch.send(sd).await;
+                                            audio_tx
+                                                .send(audio::Cmd::LoadScene(
+                                                    scene_ch.dyn_receiver(),
+                                                ))
+                                                .await;
+                                            log!(tui_tx, "load {}!", names[file_index]);
                                         }
                                     }
                                 }
                             }
                             _ => {
                                 if let Ok(dir) = root.open_dir("scenes").await {
-                                    let file_count = InputHandler::file_count(&root).await;
+                                    let names = names!(dir, ".sd");
                                     input.state = GlobalState::LoadScene {
                                         dir,
                                         file_index: 0,
-                                        file_count,
-                                        path: "scenes".to_string(),
+                                        names,
                                     };
                                 } else {
-                                    // TODO: display helpful error message
+                                    log!(tui_tx, "no /scenes found");
                                 }
                             }
                         }
@@ -636,90 +581,59 @@ pub async fn input(
                         GlobalState::LoadWav {
                             ref dir,
                             file_index,
-                            file_count,
-                            ref path,
+                            ref names,
                         } => {
-                            // find entry
-                            let mut iter = dir.iter();
-                            let mut i = 0;
-                            while let Some(Ok(entry)) = iter.next().await {
-                                let name =
-                                    core::str::from_utf8(entry.short_file_name_as_bytes()).unwrap();
+                            if let Ok(entry) = dir.open_meta(&names[file_index]).await {
                                 if entry.is_dir() {
-                                    i += 1;
-                                    if i == file_index {
-                                        // open found dir
-                                        let dir = entry.to_dir();
-                                        let file_count = InputHandler::file_count(&dir).await;
-                                        let path = if name == ".." {
-                                            path.rsplit_once('/').unwrap().0.to_string()
-                                        } else {
-                                            path.clone() + "/" + &name
-                                        };
-                                        input.state = GlobalState::LoadWav {
-                                            dir,
-                                            file_index: 0,
-                                            file_count,
-                                            path,
-                                        };
-                                        break;
+                                    let dir = entry.to_dir();
+                                    let names = names!(dir, ".rd");
+                                    input.state = GlobalState::LoadScene {
+                                        dir,
+                                        file_index: 0,
+                                        names,
+                                    };
+                                } else if entry.is_file() && names[file_index].ends_with(".rd") {
+                                    // load rd
+                                    let mut rd_file = entry.to_file();
+                                    let mut reader = crate::fs::BufReader::new(&mut rd_file);
+                                    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                    while let Ok(Some(c)) = reader.next().await {
+                                        bytes.push(c);
                                     }
-                                } else if entry.is_file() && name.ends_with(".rd") {
-                                    i += 1;
-                                    if i == file_index {
-                                        // open found rd
-                                        let mut rd_file = entry.to_file();
-                                        let mut reader = crate::fs::BufReader::new(&mut rd_file);
-                                        let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                                        while let Ok(Some(c)) = reader.next().await {
-                                            bytes.push(c);
-                                        }
-                                        // wav's filename from rd's
-                                        let name =
-                                            path.rsplit_once('.').unwrap().0.to_string() + "wav";
-                                        if let Ok(rd) =
-                                            postcard::from_bytes::<angry_surgeon_core::Rd>(&bytes)
-                                        {
-                                            input.state = GlobalState::AssignOnset {
-                                                dir: dir.clone(),
-                                                file_index,
-                                                file_count,
-                                                path: path.clone() + "/" + &name,
-                                                rd,
-                                                onset_index: 0,
-                                            }
-                                        }
-                                        break;
+                                    if let Ok(rd) =
+                                        postcard::from_bytes::<angry_surgeon_core::Rd>(&bytes)
+                                    {
+                                        input.state = GlobalState::AssignOnset {
+                                            dir: dir.clone(),
+                                            file_index,
+                                            name: names[file_index].clone(),
+                                            rd,
+                                            onset_index: 0,
+                                        };
                                     }
                                 }
                             }
                         }
                         GlobalState::AssignOnset {
-                            dir,
-                            file_index,
-                            file_count,
-                            path,
-                            ..
+                            dir, file_index, ..
                         } => {
-                            // exit wav
+                            // exit rd
                             input.state = GlobalState::LoadWav {
                                 dir: dir.clone(),
                                 file_index,
-                                file_count,
-                                path: path.rsplit_once('/').unwrap().0.to_string(),
-                            };
+                                names: names!(dir, ".rd"),
+                            }
                         }
                         _ => {
-                            if let Ok(dir) = root.open_dir("onsets").await {
-                                let file_count = InputHandler::file_count(&root).await;
-                                input.state = GlobalState::LoadWav {
+                            if let Ok(dir) = root.open_dir("scenes").await {
+                                let names = names!(dir, ".sd");
+                                input.state = GlobalState::LoadScene {
                                     dir,
                                     file_index: 0,
-                                    file_count,
-                                    path: "onsets".to_string(),
+                                    names,
                                 };
                             } else {
-                                // TODO: display helpful error message
+                                log!(tui_tx, "no /onsets found");
                             }
                         }
                     }
@@ -728,18 +642,14 @@ pub async fn input(
             Either4::Third(direction) => match direction {
                 digital::Direction::Counterclockwise => match &mut input.state {
                     GlobalState::LoadScene {
-                        file_index,
-                        file_count,
-                        ..
+                        file_index, names, ..
                     } => {
-                        InputHandler::decrement(file_index, *file_count);
+                        InputHandler::decrement(file_index, names.len());
                     }
                     GlobalState::LoadWav {
-                        file_index,
-                        file_count,
-                        ..
+                        file_index, names, ..
                     } => {
-                        InputHandler::decrement(file_index, *file_count);
+                        InputHandler::decrement(file_index, names.len());
                     }
                     GlobalState::AssignOnset {
                         rd, onset_index, ..
@@ -750,18 +660,14 @@ pub async fn input(
                 },
                 digital::Direction::Clockwise => match &mut input.state {
                     GlobalState::LoadScene {
-                        file_index,
-                        file_count,
-                        ..
+                        file_index, names, ..
                     } => {
-                        InputHandler::increment(file_index, *file_count);
+                        InputHandler::increment(file_index, names.len());
                     }
                     GlobalState::LoadWav {
-                        file_index,
-                        file_count,
-                        ..
+                        file_index, names, ..
                     } => {
-                        InputHandler::increment(file_index, *file_count);
+                        InputHandler::increment(file_index, names.len());
                     }
                     GlobalState::AssignOnset {
                         rd, onset_index, ..
@@ -830,11 +736,17 @@ pub async fn input(
                                             input.bank_a.pad_down(&audio_tx, &tui_tx).await
                                         }
                                         GlobalState::AssignOnset {
-                                            path,
+                                            dir,
+                                            name,
                                             rd,
                                             onset_index,
                                             ..
                                         } => {
+                                            // get full wav path from rd name
+                                            let mut path = alloc::string::String::new();
+                                            ancestors(&mut path, dir).await;
+                                            path.push_str(&name[..name.len() - 2]);
+                                            path.push_str("wav");
                                             if let Ok(meta) = root.open_meta(&path).await {
                                                 // assign onset to pad
                                                 let onset = Onset {
@@ -855,7 +767,7 @@ pub async fn input(
                                                     ))
                                                     .await;
                                             } else {
-                                                // TODO: display helpful error message
+                                                log!(tui_tx, "no wav found");
                                             }
                                         }
                                         _ => (),

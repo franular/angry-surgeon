@@ -12,7 +12,6 @@ use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
 use embassy_sync::zerocopy_channel::Channel as ZeroCopyChannel;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
-use ssd1306::mode::DisplayConfigAsync;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -85,7 +84,7 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
 
     // init user led
-    let mut led = embassy_stm32::gpio::Output::new(
+    let led = embassy_stm32::gpio::Output::new(
         p.PC7,
         embassy_stm32::gpio::Level::Low,
         embassy_stm32::gpio::Speed::High,
@@ -121,10 +120,10 @@ async fn main(spawner: Spawner) {
     static TUI_CH: StaticCell<Channel<NoopRawMutex, tui::Cmd, 1>> = StaticCell::new();
     let tui_ch = TUI_CH.init_with(Channel::new);
 
-    let scene = angry_surgeon_core::SceneHandler::new(audio::STEP_DIV, audio::LOOP_DIV);
+    let scene_handler = angry_surgeon_core::SceneHandler::new(audio::STEP_DIV, audio::LOOP_DIV);
     spawner.must_spawn(audio::scene_handler(
         root_dir.clone(),
-        scene,
+        scene_handler,
         grain_tx,
         audio_ch.dyn_receiver(),
     ));
@@ -161,14 +160,18 @@ async fn main(spawner: Spawner) {
 
     // init ssd1306
     let interface = ssd1306::I2CDisplayInterface::new(i2c_bus.get_ref());
-    let ssd1306 = ssd1306::Ssd1306Async::new(
+    let display = ssd1306::Ssd1306Async::new(
         interface,
         ssd1306::size::DisplaySize128x64,
         ssd1306::rotation::DisplayRotation::Rotate0,
     )
-    .into_terminal_mode();
-
-    // spawner.must_spawn(log(mpr121, ssd1306));
+    .into_buffered_graphics_mode();
+    spawner.must_spawn(tui::tui_handler(
+        tui::TuiHandler::new(),
+        led,
+        display,
+        tui_ch.dyn_receiver(),
+    ));
 
     // init encoder
     let ch1 = embassy_stm32::exti::ExtiInput::new(p.PA6, p.EXTI6, embassy_stm32::gpio::Pull::Up);
@@ -183,7 +186,6 @@ async fn main(spawner: Spawner) {
         embassy_stm32::exti::ExtiInput::new(p.PA3, p.EXTI3, embassy_stm32::gpio::Pull::Up),
         embassy_time::Duration::from_millis(20),
     );
-
     spawner.must_spawn(input::input(
         root_dir,
         input::InputHandler::new(),
@@ -195,82 +197,5 @@ async fn main(spawner: Spawner) {
         tui_ch.dyn_sender(),
     ));
 
-    print!("here!");
-}
-
-#[embassy_executor::task]
-async fn test_encoder(
-    mut encoder: input::digital::Encoder<'static>,
-    mut ssd1306: ssd1306::Ssd1306Async<
-        ssd1306::prelude::I2CInterface<
-            input::i2c::Ref<
-                'static,
-                NoopRawMutex,
-                embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async>,
-            >,
-        >,
-        ssd1306::size::DisplaySize128x64,
-        ssd1306::mode::TerminalModeAsync,
-    >,
-) {
-    ssd1306.init().await.unwrap();
-    let _ = ssd1306.clear().await;
-    let mut count = 0u8;
-    loop {
-        match encoder.wait_for_direction().await {
-            input::digital::Direction::Counterclockwise => count = count.wrapping_sub(1),
-            input::digital::Direction::Clockwise => count = count.wrapping_add(1),
-        }
-        let _ = ssd1306.clear().await;
-        let mut buf = [b' '; 12];
-        if count == 0 {
-            buf[0] = char::from_digit(0, 10).unwrap() as u8;
-        } else {
-            let mut i = 0;
-            let mut digit = 10u32.pow(count.ilog10());
-            while digit != 0 {
-                buf[i] = char::from_digit((count as u32 / digit) % 10, 10).unwrap() as u8;
-                digit /= 10;
-                i += 1;
-            }
-        }
-        let _ = ssd1306.write_str(core::str::from_utf8(&buf).unwrap()).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn log(
-    mut mpr121: input::touch::Mpr121<
-        'static,
-        input::i2c::Ref<
-            'static,
-            NoopRawMutex,
-            embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async>,
-        >,
-    >,
-    mut ssd1306: ssd1306::Ssd1306Async<
-        ssd1306::prelude::I2CInterface<
-            input::i2c::Ref<
-                'static,
-                NoopRawMutex,
-                embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async>,
-            >,
-        >,
-        ssd1306::size::DisplaySize128x64,
-        ssd1306::mode::TerminalModeAsync,
-    >,
-) {
-    ssd1306.init().await.unwrap();
-    let _ = ssd1306.clear().await;
-    loop {
-        if let Ok(touched) = mpr121.wait_for_touched().await {
-            let _ = ssd1306.clear().await;
-            let mut buf = [0u8; 12];
-            for (i, b) in buf.iter_mut().enumerate() {
-                let down = (touched >> i) & 1;
-                *b = char::from_digit(down as u32, 2).unwrap() as u8;
-            }
-            let _ = ssd1306.write_str(core::str::from_utf8(&buf).unwrap()).await;
-        }
-    }
+    print!("finished init!");
 }
