@@ -158,9 +158,12 @@ async fn main(spawner: Spawner) {
     // -----------------------------------------------------------------------------
     // --- INPUT HANDLER TASK
     // touch sensors
-    // TODO: add sensors for bank b and support in input::input()
     let mpr121_irq_a = ExtiInput::new(p.PB6, p.EXTI6, embassy_stm32::gpio::Pull::Up); // D13
     let mpr121_a = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_a)
+        .await
+        .unwrap();
+    let mpr121_irq_b = ExtiInput::new(p.PB7, p.EXTI7, embassy_stm32::gpio::Pull::Up); // D14
+    let mpr121_b = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_b)
         .await
         .unwrap();
     // encoder
@@ -177,12 +180,12 @@ async fn main(spawner: Spawner) {
         embassy_time::Duration::from_millis(20),
     );
     spawner.must_spawn(input::input(
-        fs.root_dir(),
-        input::InputHandler::new(),
+        input::InputHandler::new(fs.root_dir()),
         scenes_sw,
         onsets_sw,
         encoder,
         mpr121_a,
+        mpr121_b,
         audio_ch.dyn_sender(),
         tui_ch.dyn_sender(),
     ));

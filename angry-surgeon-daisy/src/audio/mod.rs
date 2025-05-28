@@ -27,8 +27,8 @@ pub enum Cmd<'d> {
     Clock,
     Stop,
     AssignTempo(f32),
-    SaveScene(embassy_sync::channel::DynamicSender<'d, crate::input::Sd<'d>>),
-    LoadScene(embassy_sync::channel::DynamicReceiver<'d, crate::input::Sd<'d>>),
+    SaveScene(embassy_sync::channel::DynamicSender<'d, crate::input::Sd>),
+    LoadScene(embassy_sync::channel::DynamicReceiver<'d, crate::input::Sd>),
     Bank(Bank, BankCmd),
 }
 
