@@ -10,9 +10,10 @@ pub const BANK_COUNT: usize = 2;
 pub const PAD_COUNT: usize = 8;
 pub const MAX_PHRASE_COUNT: usize = 16;
 pub const MAX_PHRASE_LEN: usize = 2usize.pow(PAD_COUNT as u32 - 1);
-pub const MAX_ONSET_COUNT: usize = 256;
 
-pub const PPQ: u8 = 24;
+/// pulses per quarter
+pub const PPQ: u16 = 2;
+/// steps per quarter
 pub const STEP_DIV: u16 = 4;
 pub const LOOP_DIV: u16 = 8;
 
@@ -73,7 +74,7 @@ async fn parse_cmd<'d>(
             for (rbank, wbank) in scene_hdlr.banks.iter().zip(sd.banks.iter_mut()) {
                 *wbank = rbank.bank.clone();
             }
-            tx.send(sd);
+            tx.send(sd).await;
         }
         Cmd::LoadScene(rx) => {
             let sd = rx.receive().await;
@@ -146,13 +147,14 @@ pub async fn scene_handler(
 
 #[embassy_executor::task]
 pub async fn output(
-    mut audio_tx: embassy_stm32::sai::Sai<'static, embassy_stm32::peripherals::SAI1, u32>,
+    // pull low
+    mut sai_tx: embassy_stm32::sai::Sai<'static, embassy_stm32::peripherals::SAI1, u32>,
     mut grain_rx: embassy_sync::zerocopy_channel::Receiver<'static, NoopRawMutex, [u16; GRAIN_LEN]>,
 ) {
     let mut buf = [0u32; hw::HALF_DMA_BUFFER_LEN];
     loop {
         let grain_fut = grain_rx.receive();
-        audio_tx.write(&buf).await.unwrap();
+        sai_tx.write(&buf).await.unwrap();
 
         let grain = grain_fut.await;
         for i in 0..buf.len() {

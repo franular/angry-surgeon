@@ -8,8 +8,6 @@ use embassy_stm32::Peri;
 use block_device_adapters::{BufStream, BufStreamError, StreamSlice, StreamSliceError};
 use embedded_io_async::{Read, ReadExactError, Seek, SeekFrom};
 
-pub const FILE_COUNT: usize = 5;
-
 type BlockDevice<'d> = StreamSlice<BufStream<Sdmmc<'d, embassy_stm32::peripherals::SDMMC1>, 512>>;
 pub type FileSystem<'d> = embedded_fatfs::FileSystem<
     BlockDevice<'d>,
@@ -29,42 +27,6 @@ pub type Dir<'d> = embedded_fatfs::Dir<
     embedded_fatfs::LossyOemCpConverter,
 >;
 pub type Error<'d> = <File<'d> as embedded_io_async::ErrorType>::Error;
-
-// pub async fn paths_recursive<'d, IO, TP, OCC>(
-//     dir: &Dir<'d, IO, TP, OCC>,
-//     offset: usize,
-// ) -> Result<[String<MAX_PATH_LEN>; 5], FatfsError<IO::Error>>
-// where
-//     IO: ReadWriteSeek,
-//     TP: TimeProvider,
-//     OCC: OemCpConverter,
-// {
-//     let mut iter = dir.iter();
-//     while let Some(entry) = iter.next().await {
-//         let entry = entry?;
-//         let ucs2 = entry.long_file_name_as_ucs2_units();
-//         if let Some(Ok(name)) = ucs2.map(String::from_utf8) {
-
-//         }
-//     }
-// }
-
-// pub async fn paths_recursive<'d, IO, TP, OCC>(
-//     dir: &Dir<'d, IO, TP, OCC>,
-// ) -> Result<Vec<String<MAX_PATH_LEN>, MAX_DIR_LEN>, FatFsError<IO::Error>>
-// where
-//     IO: ReadWriteSeek,
-//     TP: TimeProvider,
-//     OCC: OemCpConverter,
-// {
-//     let mut children = Vec::new();
-//     let mut iter = dir.iter();
-//     while let Some(entry) = iter.next().await {
-//         let entry = entry?;
-//         let ucs2 = entry.long_file_name_as_ucs2_units();
-//     }
-//     Ok(children)
-// }
 
 pub struct SdmmcFileHandler<'d> {
     root: Dir<'d>,
@@ -96,25 +58,25 @@ impl<'d> FileHandler for SdmmcFileHandler<'d> {
 
 #[derive(Debug)]
 pub enum InitError {
-    ReadExact(ReadExactError<BufStreamError<SdmmcError>>),
-    StreamSlice(StreamSliceError<BufStreamError<SdmmcError>>),
+    ReadExact,
+    StreamSlice,
 }
 
 impl From<BufStreamError<SdmmcError>> for InitError {
-    fn from(value: BufStreamError<SdmmcError>) -> Self {
-        Self::StreamSlice(value.into())
+    fn from(_value: BufStreamError<SdmmcError>) -> Self {
+        Self::StreamSlice
     }
 }
 
 impl From<ReadExactError<BufStreamError<SdmmcError>>> for InitError {
-    fn from(value: ReadExactError<BufStreamError<SdmmcError>>) -> Self {
-        Self::ReadExact(value)
+    fn from(_value: ReadExactError<BufStreamError<SdmmcError>>) -> Self {
+        Self::ReadExact
     }
 }
 
 impl From<StreamSliceError<BufStreamError<SdmmcError>>> for InitError {
-    fn from(value: StreamSliceError<BufStreamError<SdmmcError>>) -> Self {
-        Self::StreamSlice(value)
+    fn from(_value: StreamSliceError<BufStreamError<SdmmcError>>) -> Self {
+        Self::StreamSlice
     }
 }
 

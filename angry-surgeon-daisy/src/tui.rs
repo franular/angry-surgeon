@@ -77,10 +77,9 @@ macro_rules! draw_border {
     };
 }
 
+pub const FILE_COUNT: usize = 5;
 const ROWS: usize = 8;
 const COLS: usize = 16;
-pub const FILE_COUNT: usize = 5;
-pub const NAME_LEN: usize = COLS - 2;
 const TEXT_STYLE: text::TextStyle = text::TextStyleBuilder::new()
     .alignment(text::Alignment::Left)
     .baseline(text::Baseline::Top)
@@ -169,8 +168,6 @@ impl Sd {
 }
 
 pub enum Cmd {
-    Clock,
-    Stop,
     Yield,
     AssignScene(Sd),
     Log(String<COLS>),
@@ -187,6 +184,9 @@ pub enum Cmd {
 pub enum BankCmd {
     Pad(u8, bool),
     LoadOnset,
+    AssignGain(u8),
+    AssignWidth(u8),
+    AssignSpeed(u8),
     AssignPhraseDrift(u8),
     AssignKitDrift(u8),
     LoadKit(Option<u8>),
@@ -220,6 +220,9 @@ enum BankState {
 }
 
 struct BankHandler {
+    gain: u8,
+    width: u8,
+    speed: u8,
     phrase_drift: u8,
     kit_drift: u8,
     kit_index: usize,
@@ -233,6 +236,9 @@ impl BankHandler {
     fn new() -> Self {
         Self {
             phrase_drift: 0,
+            gain: 0,
+            width: 0,
+            speed: 0,
             kit_drift: 0,
             kit_index: 0,
             bank: Bank::default(),
@@ -246,6 +252,9 @@ impl BankHandler {
         match cmd {
             BankCmd::Pad(index, down) => self.pad(index, down),
             BankCmd::LoadOnset => self.load_onset(),
+            BankCmd::AssignGain(v) => self.gain = v,
+            BankCmd::AssignWidth(v) => self.width = v,
+            BankCmd::AssignSpeed(v) => self.speed = v,
             BankCmd::AssignPhraseDrift(v) => self.phrase_drift = v,
             BankCmd::AssignKitDrift(v) => self.kit_drift = v,
             BankCmd::LoadKit(index) => self.load_kit(index),
@@ -258,9 +267,9 @@ impl BankHandler {
 
     fn pad(&mut self, index: u8, down: bool) {
         if down {
-            self.downs.push(index);
+            let _ = self.downs.push(index);
             if let BankState::PushPool { .. } = &mut self.state {
-                self.pool.push_back(index);
+                let _ = self.pool.push_back(index);
             }
         } else {
             self.downs.retain(|v| *v != index);
@@ -296,7 +305,7 @@ impl BankHandler {
     fn push_pool(&mut self, index: Option<u8>) {
         if let Some(index) = index {
             if self.bank.phrases[index as usize] {
-                self.pool.push_back(index);
+                let _ = self.pool.push_back(index);
             }
         }
         self.state = BankState::PushPool { index };
@@ -325,8 +334,11 @@ impl BankHandler {
         if let Some(index) = self.downs.first() {
             pads[*index as usize] = b'@';
         }
-        text[2] = Some(Text::base(format6!(1, "pd: {:02x}", self.phrase_drift)));
-        text[3] = Some(Text::base(format6!(1, "kd: {:02x}", self.kit_drift)));
+        text[1] = Some(Text::base(format6!(b' ', "g: {:03}", self.gain)));
+        text[2] = Some(Text::base(format6!(b' ', "w: {:03}", self.width)));
+        text[3] = Some(Text::base(format6!(b' ', "s: {:03}", self.speed)));
+        text[4] = Some(Text::base(format6!(b' ', "p: {:03}", self.phrase_drift)));
+        text[5] = Some(Text::base(format6!(b' ', "k: {:03}", self.kit_drift)));
         write_pads!(text, pads);
     }
 
@@ -396,7 +408,6 @@ impl BankHandler {
 }
 
 pub struct TuiHandler {
-    clock: bool,
     log: Option<(embassy_time::Ticker, String<COLS>)>,
     state: GlobalState,
     banks: [BankHandler; BANK_COUNT],
@@ -405,7 +416,6 @@ pub struct TuiHandler {
 impl TuiHandler {
     pub fn new() -> Self {
         Self {
-            clock: false,
             log: None,
             state: GlobalState::Yield,
             banks: core::array::from_fn(|_| BankHandler::new()),
@@ -420,8 +430,6 @@ impl TuiHandler {
                     msg,
                 ))
             }
-            Cmd::Clock => self.clock = !self.clock,
-            Cmd::Stop => self.clock = false,
             Cmd::Yield => {
                 self.state = GlobalState::Yield;
                 for bank in self.banks.iter_mut() {
@@ -609,7 +617,6 @@ impl TuiHandler {
 #[embassy_executor::task]
 pub async fn tui_handler(
     mut tui_hdlr: TuiHandler,
-    mut led: embassy_stm32::gpio::Output<'static>,
     mut display: Ssd1306<'static>,
     cmd_rx: embassy_sync::channel::DynamicReceiver<'static, Cmd>,
 ) {
@@ -617,12 +624,6 @@ pub async fn tui_handler(
 
     display.init().await.unwrap();
     loop {
-        // render led
-        if tui_hdlr.clock {
-            led.set_high();
-        } else {
-            led.set_low();
-        }
         // render display
         display.clear_buffer();
         tui_hdlr.render(&mut display).await;

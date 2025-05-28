@@ -1,5 +1,7 @@
+use crate::audio::{self, PPQ, STEP_DIV};
 use embassy_stm32::{exti::ExtiInput, gpio::Level};
-use embassy_time::{Duration, Timer};
+use embassy_sync::channel::{DynamicReceiver, DynamicSender};
+use embassy_time::{Duration, Instant, Timer};
 
 const ENCODER_DELAY: u64 = 10;
 
@@ -69,6 +71,98 @@ impl<'d> Encoder<'d> {
         {
             Either::First(()) => Direction::Clockwise,
             Either::Second(()) => Direction::Counterclockwise,
+        }
+    }
+}
+
+struct Blink<'d> {
+    output: embassy_stm32::gpio::Output<'d>,
+    last: Instant,
+    sustain: Duration,
+}
+
+impl<'d> Blink<'d> {
+    async fn tick(&mut self, period: Duration) {
+        if self.output.is_set_low() {
+            self.output.set_high();
+            Timer::at(self.last + self.sustain).await;
+        } else {
+            self.output.set_low();
+            Timer::at(self.last + period).await;
+            self.last += period;
+        }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn clock(
+    mut ground_in: Debounce<'static>,
+    mut clock_in: Debounce<'static>,
+    clock_out: embassy_stm32::gpio::Output<'static>,
+    tempo_led: embassy_stm32::gpio::Output<'static>,
+    audio_tx: DynamicSender<'static, audio::Cmd<'static>>,
+    clock_rx: DynamicReceiver<'static, f32>,
+) {
+    use embassy_futures::select::*;
+
+    // default to 192 bpm
+    let mut beat_dur = Duration::from_micros((60_000_000. / 192.) as u64);
+    let mut last_ext = None;
+    let mut last_step = embassy_time::Instant::now();
+
+    let mut clock_out = Blink {
+        output: clock_out,
+        last: last_step,
+        sustain: Duration::from_millis(15),
+    };
+    let mut tempo_led = Blink {
+        output: tempo_led,
+        last: last_step,
+        sustain: Duration::from_millis(50),
+    };
+
+    loop {
+        match select6(
+            ground_in.wait_for_any_edge(),
+            clock_in.wait_for_any_edge(),
+            clock_rx.receive(),
+            embassy_time::Timer::at(last_step + beat_dur / STEP_DIV as u32),
+            clock_out.tick(beat_dur / PPQ as u32),
+            tempo_led.tick(beat_dur),
+        )
+        .await
+        {
+            Either6::First(level) => {
+                if level == Level::High {
+                    // disable external sync
+                    last_ext = None;
+                }
+            }
+            Either6::Second(level) => {
+                if level == Level::High {
+                    // set tempo from ext pulse; take care not to double tick on transition
+                    let now = embassy_time::Instant::now();
+                    if let Some(last) = last_ext {
+                        let pulse_dur: Duration = now - last;
+                        beat_dur = pulse_dur / PPQ as u32;
+                        let tempo = 60_000_000. / beat_dur.as_micros() as f32;
+                        audio_tx.send(audio::Cmd::AssignTempo(tempo)).await;
+                    }
+                    last_ext = Some(now);
+                }
+            }
+            Either6::Third(tempo) => {
+                // set tempo from pot; take care not to double tick on transition
+                beat_dur = Duration::from_micros((60_000_000. / tempo) as u64);
+                audio_tx.send(audio::Cmd::AssignTempo(tempo)).await;
+            }
+            Either6::Fourth(()) => {
+                // tick scene
+                last_step = embassy_time::Instant::now();
+                audio_tx.send(audio::Cmd::Clock).await;
+            }
+            Either6::Fifth(()) => (), // tick clock out
+            Either6::Sixth(()) => (), // tick tempo led
         }
     }
 }

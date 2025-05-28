@@ -66,7 +66,8 @@ features = ["arch-cortex-m", "executor-thread", "executor-interrupt"]
 [dependencies.embassy-time]
 # path = "../embassy/embassy-time"
 git = "https://github.com/embassy-rs/embassy"
-features = ["defmt-timestamp-uptime", "tick-hz-32_768"]
+features = ["defmt-timestamp-uptime"] # default 1 MHz tick
+# features = ["defmt-timestamp-uptime", "tick-hz-32_768"]
 
 [dependencies.embassy-usb]
 # path = "../embassy/embassy-usb"

@@ -10,8 +10,6 @@ const DMA_BUFFER_LEN: usize = HALF_DMA_BUFFER_LEN * 2;
 
 #[link_section = ".sram1_bss"]
 static TX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LEN> = GroundedArrayCell::uninit();
-#[link_section = ".sram1_bss"]
-static RX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LEN> = GroundedArrayCell::uninit();
 
 pub fn init_sai_tx<'d, T: Instance>(
     instance: Peri<'d, T>,

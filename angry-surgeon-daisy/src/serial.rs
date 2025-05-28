@@ -37,12 +37,10 @@ macro_rules! print {
     }};
 }
 
-pub static CHANNEL: embassy_sync::channel::Channel<RawMutex, [u8; 64], 8> =
+pub static CHANNEL: embassy_sync::channel::Channel<RawMutex, [u8; MAX_PACKET_LEN], 8> =
     embassy_sync::channel::Channel::new();
 
 const MAX_PACKET_LEN: usize = 64;
-
-pub type Message = [u8; MAX_PACKET_LEN];
 
 pub struct SerialData<'d> {
     ep_out_buf: [u8; 256],
@@ -111,7 +109,7 @@ pub fn init_usb_class<'d, T: Instance>(
 pub async fn serial(
     mut usb: UsbDevice<'static, Driver<'static, USB_OTG_FS>>,
     mut class: CdcAcmClass<'static, Driver<'static, USB_OTG_FS>>,
-    rx: embassy_sync::channel::DynamicReceiver<'static, Message>,
+    rx: embassy_sync::channel::DynamicReceiver<'static, [u8; MAX_PACKET_LEN]>,
 ) {
     let usb_fut = usb.run();
     let serial_fut = async {
