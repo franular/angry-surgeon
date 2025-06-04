@@ -208,13 +208,6 @@ impl<const PADS: usize, const STEPS: usize> Default for Bank<PADS, STEPS> {
     }
 }
 
-/// scene preset
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Sd<const BANKS: usize, const PADS: usize, const STEPS: usize> {
-    #[serde(with = "serde_arrays")]
-    pub banks: [Bank<PADS, STEPS>; BANKS],
-}
-
 pub struct BankHandler<
     const PADS: usize,
     const STEPS: usize,
@@ -225,11 +218,11 @@ pub struct BankHandler<
     clock: f32,
     tempo: f32,
     pub step_div: u16,
-    pub loop_div: u16,
 
     pub gain: f32,
     pub width: f32,
     pub speed: Mod<f32>,
+    pub loop_div: Mod<f32>,
     pub phrase_drift: f32,
     pub kit_drift: f32,
 
@@ -246,17 +239,17 @@ pub struct BankHandler<
 impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, IO: Read + Write + Seek>
     BankHandler<PADS, STEPS, PHRASES, IO>
 {
-    fn new(step_div: u16, loop_div: u16) -> Self {
+    fn new(step_div: u16, loop_div: f32) -> Self {
         Self {
             quant: false,
             clock: 0.,
             tempo: 0.,
             step_div,
-            loop_div,
 
             gain: 1.,
             width: 1.,
             speed: Mod::new(1., 1.),
+            loop_div: Mod::new(loop_div, 1.),
             phrase_drift: 0.,
             kit_drift: 0.,
 
@@ -316,7 +309,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, IO: Read + Wri
                 let len = if let Some(steps) = wav.steps {
                     (f32::from(*len) * wav.len as f32 / steps as f32) as u64 & !1
                 } else {
-                    (f32::from(*len) * SAMPLE_RATE as f32 * 60. / self.tempo * self.loop_div as f32)
+                    (f32::from(*len) * SAMPLE_RATE as f32 * 60. / self.tempo * self.loop_div.net())
                         as u64
                         & !1
                 };
@@ -691,15 +684,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, IO: Read + Wri
     }
 }
 
-impl<const BANKS: usize, const PADS: usize, const STEPS: usize> Default for Sd<BANKS, PADS, STEPS> {
-    fn default() -> Self {
-        Self {
-            banks: core::array::from_fn(|_| Bank::default()),
-        }
-    }
-}
-
-pub struct SceneHandler<
+pub struct SystemHandler<
     const BANKS: usize,
     const PADS: usize,
     const STEPS: usize,
@@ -715,9 +700,9 @@ impl<
         const STEPS: usize,
         const PHRASES: usize,
         IO: Read + Write + Seek,
-    > SceneHandler<BANKS, PADS, STEPS, PHRASES, IO>
+    > SystemHandler<BANKS, PADS, STEPS, PHRASES, IO>
 {
-    pub fn new(step_div: u16, loop_div: u16) -> Self {
+    pub fn new(step_div: u16, loop_div: f32) -> Self {
         // oh rust, why won't you let me use generics in const operations
         assert_eq!(STEPS, 2usize.pow(PADS as u32 - 1));
         Self {

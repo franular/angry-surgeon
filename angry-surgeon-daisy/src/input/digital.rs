@@ -95,6 +95,22 @@ impl<'d> Blink<'d> {
 }
 
 #[embassy_executor::task]
+pub async fn encoder_sw(mut sw: Debounce<'static>, tx: DynamicSender<'static, Level>) {
+    loop {
+        let level = sw.wait_for_any_edge().await;
+        tx.send(level).await;
+    }
+}
+
+#[embassy_executor::task]
+pub async fn encoder(mut encoder: Encoder<'static>, tx: DynamicSender<'static, Direction>) {
+    loop {
+        let direction = encoder.wait_for_direction().await;
+        tx.send(direction).await;
+    }
+}
+
+#[embassy_executor::task]
 pub async fn clock(
     mut ground_in: Debounce<'static>,
     mut clock_in: Debounce<'static>,
@@ -157,7 +173,7 @@ pub async fn clock(
                 audio_tx.send(audio::Cmd::AssignTempo(tempo)).await;
             }
             Either6::Fourth(()) => {
-                // tick scene
+                // tick system
                 last_step = embassy_time::Instant::now();
                 audio_tx.send(audio::Cmd::Clock).await;
             }

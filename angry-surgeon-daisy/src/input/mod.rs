@@ -1,14 +1,16 @@
 use core::str::FromStr;
 
 use crate::{
-    audio::{self, BANK_COUNT, MAX_PHRASE_LEN, PAD_COUNT},
+    audio::{self, MAX_PHRASE_LEN, PAD_COUNT},
     fs::hw::Dir,
     tui,
 };
 use angry_surgeon_core::{Event, Fraction, Onset, Wav};
 use embassy_stm32::gpio::Level;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::DynamicSender};
-use embassy_time::WithTimeout;
+use embassy_sync::{
+    blocking_mutex::raw::NoopRawMutex,
+    channel::{DynamicReceiver, DynamicSender},
+};
 use embedded_io_async::Write;
 
 pub mod analog;
@@ -24,6 +26,7 @@ macro_rules! audio_bank_cmd {
         audio::Cmd::Bank($bank, audio::BankCmd::$cmd($($params)+))
     };
 }
+use audio_bank_cmd;
 
 macro_rules! tui_bank_cmd {
     ($bank:expr,$cmd:ident) => {
@@ -33,6 +36,7 @@ macro_rules! tui_bank_cmd {
         tui::Cmd::Bank($bank, tui::BankCmd::$cmd($($params)+))
     };
 }
+use tui_bank_cmd;
 
 macro_rules! dec {
     ($index:expr,$count:expr) => {
@@ -41,7 +45,7 @@ macro_rules! dec {
         } else {
             *$index -= 1;
         }
-    }
+    };
 }
 
 macro_rules! inc {
@@ -51,7 +55,7 @@ macro_rules! inc {
         } else {
             *$index += 1;
         }
-    }
+    };
 }
 
 macro_rules! log {
@@ -125,8 +129,8 @@ macro_rules! to_fs {
     }};
 }
 
-pub type Sd = angry_surgeon_core::Sd<BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN>;
-type SdChannel = embassy_sync::channel::Channel<NoopRawMutex, Sd, 1>;
+pub type Bank = angry_surgeon_core::Bank<PAD_COUNT, MAX_PHRASE_LEN>;
+type BdChannel = embassy_sync::channel::Channel<NoopRawMutex, Bank, 1>;
 
 async fn ancestors(path: &mut alloc::string::String, parent: &Dir<'_>) {
     if let Ok(entry) = parent.open_meta("..").await {
@@ -147,28 +151,25 @@ enum Index {
     Kit = 11,
 }
 
-#[allow(clippy::large_enum_variant)]
-enum GlobalState<'d> {
+struct Context<'d> {
+    dir: Dir<'d>,
+    file_index: usize,
+    names: alloc::vec::Vec<alloc::string::String>,
+}
+
+enum GlobalState {
     Yield,
-    LoadScene {
-        dir: Dir<'d>,
-        file_index: usize,
-        names: alloc::vec::Vec<alloc::string::String>,
+    LoadBd {
+        bank: audio::Bank,
     },
-    LoadWav {
-        dir: Dir<'d>,
-        file_index: usize,
-        names: alloc::vec::Vec<alloc::string::String>,
-    },
-    AssignOnset {
-        dir: Dir<'d>,
-        file_index: usize,
-        name: alloc::string::String,
+    LoadRd,
+    LoadOnset {
         rd: angry_surgeon_core::Rd,
         onset_index: usize,
     },
 }
 
+#[derive(PartialEq)]
 enum BankState {
     LoadOnset,
     LoadKit,
@@ -231,7 +232,7 @@ impl BankHandler {
         audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
         tui_tx: &DynamicSender<'_, tui::Cmd>,
     ) {
-        if let BankState::LoadOnset = self.state {
+        if self.state == BankState::LoadOnset {
             if self.shift {
                 // init record
                 self.state = BankState::BakeRecord;
@@ -286,7 +287,7 @@ impl BankHandler {
         audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
         tui_tx: &DynamicSender<'_, tui::Cmd>,
     ) {
-        if let BankState::LoadOnset = self.state {
+        if self.state == BankState::LoadOnset {
             if self.shift {
                 // init build pool
                 self.state = BankState::BuildPool { cleared: false };
@@ -314,19 +315,12 @@ impl BankHandler {
     }
 
     async fn kit_down(&mut self, tui_tx: &DynamicSender<'_, tui::Cmd>) {
-        if let BankState::LoadOnset = self.state {
-            if self.shift {
-                // init clear onset
-                self.state = BankState::ClearOnset;
-                tui_tx
-                    .send(tui_bank_cmd!(self.bank, ClearOnset, None))
-                    .await;
-            } else {
-                // init load kit
-                self.state = BankState::LoadKit;
-                tui_tx.send(tui_bank_cmd!(self.bank, LoadKit, None)).await;
-            }
+        if self.state == BankState::LoadOnset && !self.shift {
+            // init load kit
+            self.state = BankState::LoadKit;
+            tui_tx.send(tui_bank_cmd!(self.bank, LoadKit, None)).await;
         }
+        // bank save handled in InputHandler
     }
 
     async fn pad_up(
@@ -476,7 +470,10 @@ impl BankHandler {
 
 pub struct InputHandler<'d> {
     root: Dir<'d>,
-    state: GlobalState<'d>,
+    onsets_cx: Option<Context<'d>>,
+    banks_cx: Option<Context<'d>>,
+    banks_maybe_focus: Option<audio::Bank>,
+    state: GlobalState,
     bank_a: BankHandler,
     bank_b: BankHandler,
 }
@@ -485,211 +482,205 @@ impl<'d> InputHandler<'d> {
     pub fn new(root: Dir<'d>) -> Self {
         Self {
             root,
+            onsets_cx: None,
+            banks_cx: None,
+            banks_maybe_focus: None,
             state: GlobalState::Yield,
             bank_a: BankHandler::new(audio::Bank::A),
             bank_b: BankHandler::new(audio::Bank::B),
         }
     }
 
-    /// save scene to new file
-    async fn save_scene(&self, scene_ch: &'static SdChannel, audio_tx: &DynamicSender<'_, audio::Cmd<'_>>, tui_tx: &DynamicSender<'_, tui::Cmd>) {
+    /// save bank to new file
+    async fn save_bank(
+        &self,
+        bank: audio::Bank,
+        bank_ch: &'static BdChannel,
+        audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
+        tui_tx: &DynamicSender<'_, tui::Cmd>,
+    ) {
         audio_tx
-            .send(crate::audio::Cmd::SaveScene(scene_ch.dyn_sender()))
+            .send(audio_bank_cmd!(bank, SaveBank, bank_ch.dyn_sender()))
             .await;
-        let sd = scene_ch.receive().await;
-        if let Ok(bytes) = postcard::to_allocvec(&sd) {
+        let bd = bank_ch.receive().await;
+        if let Ok(bytes) = postcard::to_allocvec(&bd) {
             let mut index = 0;
-            while self.root
-                .exists(&alloc::format!("scenes/scene{}.sd", index))
+            while self
+                .root
+                .exists(&alloc::format!("banks/bank{}.bd", index))
                 .await
                 .unwrap()
             {
                 index += 1;
             }
-            let mut sd_file = self.root
-                .create_file(&alloc::format!("scenes/scene{}.sd", index))
+            let mut bd_file = self
+                .root
+                .create_file(&alloc::format!("banks/bank{}.bd", index))
                 .await
                 .unwrap();
-            sd_file.write_all(&bytes).await.unwrap();
+            bd_file.write_all(&bytes).await.unwrap();
 
-            let name =
-                heapless::String::from_str(&alloc::format!("scene{}", index))
-                    .unwrap();
+            let name = heapless::String::from_str(&alloc::format!("bank{}", index)).unwrap();
             tui_tx.send(tui::Cmd::Log(name)).await;
         }
     }
 
-    /// load target dir/scene
-    async fn load_scene(&mut self, scene_ch: &'static SdChannel, audio_tx: &DynamicSender<'_, audio::Cmd<'_>>, tui_tx: &DynamicSender<'_, tui::Cmd>) {
-        if let GlobalState::LoadScene { ref dir, file_index, ref names } = self.state {
-            if let Ok(entry) = dir.open_meta(&names[file_index]).await {
-                if entry.is_dir() {
-                    let dir = entry.to_dir();
-                    let names = names!(dir, ".sd");
-                    tui_tx
-                        .send(tui::Cmd::LoadScene(to_fs!(
-                            names, file_index, ".sd"
-                        )))
-                        .await;
-                    self.state = GlobalState::LoadScene {
-                        dir,
-                        file_index: 0,
-                        names,
-                    };
-                } else if entry.is_file() && names[file_index].ends_with(".sd")
-                {
-                    // load sd
-                    let mut sd_file = entry.to_file();
-                    let mut reader = crate::fs::BufReader::new(&mut sd_file);
-                    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                    while let Ok(Some(c)) = reader.next().await {
-                        bytes.push(c);
-                    }
-                    if let Ok(sd) = postcard::from_bytes::<Sd>(&bytes) {
-                        tui_tx
-                            .send(tui::Cmd::AssignScene(tui::Sd::from_audio(
-                                &sd,
-                            )))
-                            .await;
-                        scene_ch.send(sd).await;
-                        audio_tx
-                            .send(audio::Cmd::LoadScene(
-                                scene_ch.dyn_receiver(),
-                            ))
-                            .await;
-                        log!(tui_tx, "load {}!", names[file_index]);
-                    } else {
-                        log!(tui_tx, "bad .sd");
-                    }
-                }
-            }
-        } else if let Ok(dir) = self.root.open_dir("scenes").await {
-            let names = names!(dir, ".sd");
-            tui_tx
-                .send(tui::Cmd::LoadScene(to_fs!(names, 0, ".sd")))
-                .await;
-            self.state = GlobalState::LoadScene {
-                dir,
-                file_index: 0,
-                names,
-            };
-        } else {
-            log!(tui_tx, "no /scenes found");
-        }
-    }
-
-    /// load target dir/rd
-    async fn load_onsets(&mut self, tui_tx: &DynamicSender<'_, tui::Cmd>) {
+    /// load target dir/.bd/.rd depending on state
+    async fn open(
+        &mut self,
+        bank_ch: &'static BdChannel,
+        audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
+        tui_tx: &DynamicSender<'_, tui::Cmd>,
+    ) {
         match &self.state {
-            GlobalState::LoadWav {
-                dir,
-                file_index,
-                names,
-            } => {
-                if let Ok(entry) = dir.open_meta(&names[*file_index]).await {
-                    if entry.is_dir() {
-                        let dir = entry.to_dir();
-                        let names = names!(dir, ".rd");
-                        tui_tx
-                            .send(tui::Cmd::LoadScene(to_fs!(names, *file_index, ".rd")))
-                            .await;
-                        self.state = GlobalState::LoadScene {
+            GlobalState::Yield => {
+                if let Some(bank) = self.banks_maybe_focus.take() {
+                    // trans load bd
+                    if let Some(cx) = &mut self.banks_cx {
+                        // recall dir
+                        let names = names!(cx.dir, ".bd");
+                        tui_tx.send(tui::Cmd::LoadBd(to_fs!(names, cx.file_index, ".bd"))).await;
+                        cx.names = names;
+                        self.state = GlobalState::LoadBd { bank };
+                    } else if let Ok(dir) = self.root.open_dir("banks").await {
+                        // open /banks
+                        let names = names!(dir, ".bd");
+                        tui_tx.send(tui::Cmd::LoadBd(to_fs!(names, 0, ".bd"))).await;
+                        self.banks_cx = Some(Context {
                             dir,
                             file_index: 0,
                             names,
-                        };
-                    } else if entry.is_file() && names[*file_index].ends_with(".rd") {
-                        // load rd
-                        let mut rd_file = entry.to_file();
-                        let mut reader = crate::fs::BufReader::new(&mut rd_file);
-                        let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        });
+                        self.state = GlobalState::LoadBd { bank };
+                    } else {
+                        log!(tui_tx, "no /banks found");
+                    }
+                } else {
+                    // trans load rd
+                    if let Some(cx) = &mut self.onsets_cx {
+                        // recall dir
+                        let names = names!(cx.dir, ".rd");
+                        tui_tx.send(tui::Cmd::LoadRd(to_fs!(names, cx.file_index, ".rd"))).await;
+                        cx.names = names;
+                        self.state = GlobalState::LoadRd;
+                    } else if let Ok(dir) = self.root.open_dir("onsets").await {
+                        // open /onsets
+                        let names = names!(dir, ".rd");
+                        tui_tx.send(tui::Cmd::LoadRd(to_fs!(names, 0, ".rd"))).await;
+                        self.onsets_cx = Some(Context {
+                            dir,
+                            file_index: 0,
+                            names,
+                        });
+                        self.state = GlobalState::LoadRd;
+                    } else {
+                        log!(tui_tx, "no /onsets found");
+                    }
+                }
+            }
+            GlobalState::LoadBd { bank } => {
+                let cx = self.banks_cx.as_ref().unwrap();
+                if let Ok(entry) = cx.dir.open_meta(&cx.names[cx.file_index]).await {
+                    if entry.is_dir() {
+                        // open dir
+                        let dir = entry.to_dir();
+                        let names = names!(dir, ".bd");
+                        tui_tx.send(tui::Cmd::LoadBd(to_fs!(names, 0, ".bd"))).await;
+                        self.banks_cx = Some(Context {
+                            dir,
+                            file_index: 0,
+                            names,
+                        });
+                    } else if entry.is_file() && cx.names[cx.file_index].ends_with(".bd") {
+                        // load bd
+                        let mut bd_file = entry.to_file();
+                        let mut reader = crate::fs::BufReader::new(&mut bd_file);
+                        let mut bytes = alloc::vec::Vec::new();
                         while let Ok(Some(c)) = reader.next().await {
                             bytes.push(c);
                         }
-                        if let Ok(rd) =
-                            postcard::from_bytes::<angry_surgeon_core::Rd>(&bytes)
-                        {
-                            let name = names[*file_index].clone();
+                        if let Ok(bd) = postcard::from_bytes::<Bank>(&bytes) {
                             tui_tx
-                                .send(tui::Cmd::AssignOnset {
+                                .send(tui_bank_cmd!(*bank, LoadBank, tui::Bank::from_audio(&bd)))
+                                .await;
+                            bank_ch.send(bd).await;
+                            audio_tx
+                                .send(audio_bank_cmd!(*bank, LoadBank, bank_ch.dyn_receiver()))
+                                .await;
+                            log!(tui_tx, "load {}!", cx.names[cx.file_index]);
+                        } else {
+                            log!(tui_tx, "bad .bd");
+                        }
+                    }
+                } else {
+                    log!(tui_tx, "bad fs entry");
+                }
+            }
+            GlobalState::LoadRd => {
+                let cx = self.onsets_cx.as_ref().unwrap();
+                if let Ok(entry) = cx.dir.open_meta(&cx.names[cx.file_index]).await {
+                    if entry.is_dir() {
+                        // open dir
+                        let dir = entry.to_dir();
+                        let names = names!(dir, ".rd");
+                        tui_tx.send(tui::Cmd::LoadRd(to_fs!(names, 0, ".rd"))).await;
+                        self.onsets_cx = Some(Context {
+                            dir,
+                            file_index: 0,
+                            names,
+                        });
+                    } else if entry.is_file() && cx.names[cx.file_index].ends_with(".rd") {
+                        // load rd
+                        let mut rd_file = entry.to_file();
+                        let mut reader = crate::fs::BufReader::new(&mut rd_file);
+                        let mut bytes = alloc::vec::Vec::new();
+                        while let Ok(Some(c)) = reader.next().await {
+                            bytes.push(c);
+                        }
+                        if let Ok(rd) = postcard::from_bytes::<angry_surgeon_core::Rd>(&bytes) {
+                            let name = cx.names[cx.file_index].clone();
+                            tui_tx
+                                .send(tui::Cmd::LoadOnset {
                                     name: to_fs!(name, ".rd"),
                                     index: 0,
                                     count: rd.onsets.len(),
                                 })
                                 .await;
-                            self.state = GlobalState::AssignOnset {
-                                dir: dir.clone(),
-                                file_index: *file_index,
-                                name,
-                                rd,
-                                onset_index: 0,
-                            };
+                            self.state = GlobalState::LoadOnset { rd, onset_index: 0 };
                         } else {
                             log!(tui_tx, "bad .rd");
                         }
                     }
-                }
-            }
-            GlobalState::AssignOnset {
-                dir, file_index, ..
-            } => {
-                // exit rd
-                let names = names!(dir, ".rd");
-                tui_tx
-                    .send(tui::Cmd::LoadWav(to_fs!(names, *file_index, ".rd")))
-                    .await;
-                self.state = GlobalState::LoadWav {
-                    dir: dir.clone(),
-                    file_index: *file_index,
-                    names,
-                }
-            }
-            _ => {
-                if let Ok(dir) = self.root.open_dir("onsets").await {
-                    let names = names!(dir, ".rd");
-                    tui_tx
-                        .send(tui::Cmd::LoadWav(to_fs!(names, 0, ".rd")))
-                        .await;
-                    self.state = GlobalState::LoadScene {
-                        dir,
-                        file_index: 0,
-                        names,
-                    };
                 } else {
-                    log!(tui_tx, "no /onsets found");
+                    log!(tui_tx, "bad fs entry");
                 }
             }
+            GlobalState::LoadOnset { .. } => self.state = GlobalState::LoadRd,
         }
     }
 
     async fn decrement(&mut self, tui_tx: &DynamicSender<'_, tui::Cmd>) {
         match &mut self.state {
-            GlobalState::LoadScene {
-                file_index, names, ..
-            } => {
-                dec!(file_index, names.len());
+            GlobalState::LoadBd { .. } => {
+                let cx = self.banks_cx.as_mut().unwrap();
+                dec!(&mut cx.file_index, cx.names.len());
                 tui_tx
-                    .send(tui::Cmd::LoadScene(to_fs!(names, *file_index, ".sd")))
+                    .send(tui::Cmd::LoadBd(to_fs!(cx.names, cx.file_index, ".bd")))
                     .await;
             }
-            GlobalState::LoadWav {
-                file_index, names, ..
-            } => {
-                dec!(file_index, names.len());
+            GlobalState::LoadRd => {
+                let cx = self.onsets_cx.as_mut().unwrap();
+                dec!(&mut cx.file_index, cx.names.len());
                 tui_tx
-                    .send(tui::Cmd::LoadWav(to_fs!(names, *file_index, ".rd")))
+                    .send(tui::Cmd::LoadRd(to_fs!(cx.names, cx.file_index, ".rd")))
                     .await;
             }
-            GlobalState::AssignOnset {
-                name,
-                rd,
-                onset_index,
-                ..
-            } => {
+            GlobalState::LoadOnset { rd, onset_index } => {
+                let cx = self.onsets_cx.as_ref().unwrap();
                 dec!(onset_index, rd.onsets.len());
                 tui_tx
-                    .send(tui::Cmd::AssignOnset {
-                        name: to_fs!(name, ".rd"),
+                    .send(tui::Cmd::LoadOnset {
+                        name: to_fs!(cx.names[cx.file_index], ".rd"),
                         index: *onset_index,
                         count: rd.onsets.len(),
                     })
@@ -701,32 +692,26 @@ impl<'d> InputHandler<'d> {
 
     async fn increment(&mut self, tui_tx: &DynamicSender<'_, tui::Cmd>) {
         match &mut self.state {
-            GlobalState::LoadScene {
-                file_index, names, ..
-            } => {
-                inc!(file_index, names.len());
+            GlobalState::LoadBd { .. } => {
+                let cx = self.banks_cx.as_mut().unwrap();
+                inc!(&mut cx.file_index, cx.names.len());
                 tui_tx
-                    .send(tui::Cmd::LoadScene(to_fs!(names, *file_index, ".sd")))
+                    .send(tui::Cmd::LoadBd(to_fs!(cx.names, cx.file_index, ".bd")))
                     .await;
             }
-            GlobalState::LoadWav {
-                file_index, names, ..
-            } => {
-                inc!(file_index, names.len());
+            GlobalState::LoadRd => {
+                let cx = self.onsets_cx.as_mut().unwrap();
+                inc!(&mut cx.file_index, cx.names.len());
                 tui_tx
-                    .send(tui::Cmd::LoadWav(to_fs!(names, *file_index, ".rd")))
+                    .send(tui::Cmd::LoadRd(to_fs!(cx.names, cx.file_index, ".rd")))
                     .await;
             }
-            GlobalState::AssignOnset {
-                name,
-                rd,
-                onset_index,
-                ..
-            } => {
+            GlobalState::LoadOnset { rd, onset_index } => {
+                let cx = self.onsets_cx.as_ref().unwrap();
                 inc!(onset_index, rd.onsets.len());
                 tui_tx
-                    .send(tui::Cmd::AssignOnset {
-                        name: to_fs!(name, ".rd"),
+                    .send(tui::Cmd::LoadOnset {
+                        name: to_fs!(cx.names[cx.file_index], ".rd"),
                         index: *onset_index,
                         count: rd.onsets.len(),
                     })
@@ -736,23 +721,40 @@ impl<'d> InputHandler<'d> {
         }
     }
 
-    async fn touch_up(&mut self, bank: audio::Bank, index: u8, audio_tx: &DynamicSender<'_, audio::Cmd<'_>>, tui_tx: &DynamicSender<'_, tui::Cmd>) {
+    async fn touch_up(
+        &mut self,
+        bank: audio::Bank,
+        index: u8,
+        shift_tx: &DynamicSender<'static, (audio::Bank, bool)>,
+        audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
+        tui_tx: &DynamicSender<'_, tui::Cmd>,
+    ) {
         let my_bank = match bank {
             audio::Bank::A => &mut self.bank_a,
             audio::Bank::B => &mut self.bank_b,
         };
         if index == Index::Shift as u8 {
             my_bank.shift = false;
+            // unfocus for load bd
+            if !self.bank_a.shift && !self.bank_b.shift {
+                self.banks_maybe_focus = None;
+            }
+            shift_tx.send((bank, false)).await;
         } else {
-            if matches!(self.state, GlobalState::LoadScene { .. } | GlobalState::LoadWav { .. }) {
+            if matches!(
+                self.state,
+                GlobalState::LoadBd { .. } | GlobalState::LoadRd
+            ) {
                 tui_tx.send(tui::Cmd::Yield).await;
                 self.state = GlobalState::Yield;
             }
             if (0..Index::BankOffset as u8).contains(&index) {
                 my_bank.downs.retain(|&i| i != index);
                 tui_tx.send(tui_bank_cmd!(bank, Pad, index, false)).await;
-                if let GlobalState::AssignOnset { .. } = self.state {
-                    audio_tx.send(audio_bank_cmd!(bank, ForceEvent, Event::Sync)).await;
+                if let GlobalState::LoadOnset { .. } = self.state {
+                    audio_tx
+                        .send(audio_bank_cmd!(bank, ForceEvent, Event::Sync))
+                        .await;
                 } else {
                     my_bank.pad_up(audio_tx, tui_tx).await;
                 }
@@ -766,27 +768,53 @@ impl<'d> InputHandler<'d> {
         }
     }
 
-    async fn touch_down(&mut self, bank: audio::Bank, index: u8, audio_tx: &DynamicSender<'_, audio::Cmd<'_>>, tui_tx: &DynamicSender<'_, tui::Cmd>) {
+    async fn touch_down(
+        &mut self,
+        bank: audio::Bank,
+        index: u8,
+        bank_ch: &'static BdChannel,
+        shift_tx: &DynamicSender<'static, (audio::Bank, bool)>,
+        audio_tx: &DynamicSender<'_, audio::Cmd<'_>>,
+        tui_tx: &DynamicSender<'_, tui::Cmd>,
+    ) {
         let my_bank = match bank {
             audio::Bank::A => &mut self.bank_a,
             audio::Bank::B => &mut self.bank_b,
         };
         if index == Index::Shift as u8 {
             my_bank.shift = true;
+            // focus for load bd
+            self.banks_maybe_focus = Some(bank);
+            shift_tx.send((bank, true)).await;
+        } else if index == Index::Kit as u8 {
+            if let GlobalState::LoadBd { bank: b } = &mut self.state {
+                // target bank for load bank
+                *b = bank;
+            } else if my_bank.shift {
+                self.save_bank(bank, bank_ch, audio_tx, tui_tx).await;
+            } else {
+                my_bank.kit_down(tui_tx).await;
+            }
         } else {
-            if !matches!(self.state, GlobalState::LoadScene { .. } | GlobalState::LoadWav { .. }) {
+            if matches!(self.state, GlobalState::LoadRd | GlobalState::LoadBd { .. }) {
                 tui_tx.send(tui::Cmd::Yield).await;
                 self.state = GlobalState::Yield;
             }
             if (0..Index::BankOffset as u8).contains(&index) {
                 let _ = my_bank.downs.push(index);
                 tui_tx.send(tui_bank_cmd!(bank, Pad, index, true)).await;
-                if let GlobalState::AssignOnset { dir, name, rd, onset_index, .. } = &mut self.state {
+                if let GlobalState::LoadOnset { rd, onset_index } = &mut self.state {
+                    let cx = self.onsets_cx.as_ref().unwrap();
+                    let name = &cx.names[cx.file_index];
                     // get full wav path from rd name
                     let mut path = alloc::string::String::new();
-                    ancestors(&mut path, dir).await;
+                    ancestors(&mut path, &cx.dir).await;
                     path.push_str(&alloc::format!("{}wav", &name[..name.len() - 2]));
-                    if let Ok(meta) = dir.open_meta(&alloc::format!("{}wav", &name[..name.len() - 2])).await {
+                    if let Ok(meta) = cx
+                        .dir
+                        .open_meta(&alloc::format!("{}wav", &name[..name.len() - 2]))
+                        .await
+                    {
                         // assign onset to pad
                         let onset = Onset {
                             wav: Wav {
@@ -797,7 +825,9 @@ impl<'d> InputHandler<'d> {
                             },
                             start: rd.onsets[*onset_index],
                         };
-                        audio_tx.send(audio_bank_cmd!(bank, AssignOnset, index, onset)).await;
+                        audio_tx
+                            .send(audio_bank_cmd!(bank, AssignOnset, index, onset))
+                            .await;
                     } else {
                         log!(tui_tx, "no wav found");
                     }
@@ -808,8 +838,6 @@ impl<'d> InputHandler<'d> {
                 my_bank.reverse_down(audio_tx, tui_tx).await;
             } else if index == Index::Hold as u8 {
                 my_bank.hold_down(audio_tx, tui_tx).await;
-            } else if index == Index::Kit as u8 {
-                my_bank.kit_down(tui_tx).await;
             }
         }
     }
@@ -818,9 +846,6 @@ impl<'d> InputHandler<'d> {
 #[embassy_executor::task]
 pub async fn input(
     mut input: InputHandler<'static>,
-    mut scenes_sw: digital::Debounce<'static>,
-    mut onsets_sw: digital::Debounce<'static>,
-    mut encoder: digital::Encoder<'static>,
     mut mpr121_a: touch::Mpr121<
         'static,
         i2c::Ref<
@@ -837,71 +862,86 @@ pub async fn input(
             embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async>,
         >,
     >,
+    shift_tx: DynamicSender<'static, (audio::Bank, bool)>,
     audio_tx: DynamicSender<'static, audio::Cmd<'static>>,
     tui_tx: DynamicSender<'static, tui::Cmd>,
+    encoder_sw_rx: DynamicReceiver<'static, Level>,
+    encoder_rx: DynamicReceiver<'static, digital::Direction>,
 ) {
     use embassy_futures::select::*;
 
-    static SCENE_CH: static_cell::StaticCell<embassy_sync::channel::Channel<NoopRawMutex, Sd, 1>> =
-        static_cell::StaticCell::new();
-    let scene_ch = SCENE_CH.init_with(embassy_sync::channel::Channel::new);
+    static BANK_CH: static_cell::StaticCell<
+        embassy_sync::channel::Channel<NoopRawMutex, Bank, 1>,
+    > = static_cell::StaticCell::new();
+    let bank_ch = BANK_CH.init_with(embassy_sync::channel::Channel::new);
 
     let mut last_touched_a = 0u16;
     let mut last_touched_b = 0u16;
     loop {
-        match select5(
-            scenes_sw.wait_for_any_edge(),
-            onsets_sw.wait_for_any_edge(),
-            encoder.wait_for_direction(),
+        match select4(
+            encoder_sw_rx.receive(),
+            encoder_rx.receive(),
             mpr121_a.wait_for_touched(),
             mpr121_b.wait_for_touched(),
         )
         .await
         {
-            Either5::First(level) => if level == Level::Low {
-                if scenes_sw
-                    .wait_for_any_edge()
-                    .with_timeout(embassy_time::Duration::from_secs(2))
-                    .await
-                    .is_err()
-                {
-                    input.save_scene(scene_ch, &audio_tx, &tui_tx).await;
-                } else {
-                    input.load_scene(scene_ch, &audio_tx, &tui_tx).await;
+            Either4::First(level) => {
+                if level == Level::Low {
+                    input.open(bank_ch, &audio_tx, &tui_tx).await;
                 }
             }
-            Either5::Second(level) => if level == Level::Low {
-                input.load_onsets(&tui_tx).await;
-            }
-            Either5::Third(direction) => match direction {
+            Either4::Second(direction) => match direction {
                 digital::Direction::Counterclockwise => input.decrement(&tui_tx).await,
                 digital::Direction::Clockwise => input.increment(&tui_tx).await,
-            }
-            Either5::Fourth(curr_touched) => {
+            },
+            Either4::Third(curr_touched) => {
                 let curr_touched = curr_touched.unwrap();
                 for index in 0..12 {
                     let curr = (curr_touched >> index) & 1;
                     let last = (last_touched_a >> index) & 1;
                     if curr != last {
                         if curr == 0 {
-                            input.touch_up(audio::Bank::A, index, &audio_tx, &tui_tx).await;
+                            input
+                                .touch_up(audio::Bank::A, index, &shift_tx, &audio_tx, &tui_tx)
+                                .await;
                         } else {
-                            input.touch_down(audio::Bank::A, index, &audio_tx, &tui_tx).await;
+                            input
+                                .touch_down(
+                                    audio::Bank::A,
+                                    index,
+                                    bank_ch,
+                                    &shift_tx,
+                                    &audio_tx,
+                                    &tui_tx,
+                                )
+                                .await;
                         }
                     }
                 }
                 last_touched_a = curr_touched;
             }
-            Either5::Fifth(curr_touched) => {
+            Either4::Fourth(curr_touched) => {
                 let curr_touched = curr_touched.unwrap();
                 for index in 0..12 {
                     let curr = (curr_touched >> index) & 1;
                     let last = (last_touched_b >> index) & 1;
-                    if curr != last{
+                    if curr != last {
                         if curr == 0 {
-                            input.touch_up(audio::Bank::B, index, &audio_tx, &tui_tx).await;
+                            input
+                                .touch_up(audio::Bank::B, index, &shift_tx, &audio_tx, &tui_tx)
+                                .await;
                         } else {
-                            input.touch_down(audio::Bank::B, index, &audio_tx, &tui_tx).await;
+                            input
+                                .touch_down(
+                                    audio::Bank::B,
+                                    index,
+                                    bank_ch,
+                                    &shift_tx,
+                                    &audio_tx,
+                                    &tui_tx,
+                                )
+                                .await;
                         }
                     }
                 }

@@ -137,8 +137,14 @@ async fn main(spawner: Spawner) {
     let audio_ch = AUDIO_CH.init_with(Channel::new);
     static CLOCK_CH: StaticCell<Channel<NoopRawMutex, f32, 1>> = StaticCell::new();
     let clock_ch = CLOCK_CH.init_with(Channel::new);
-    static TUI_CH: StaticCell<Channel<NoopRawMutex, tui::Cmd, 1>> = StaticCell::new();
-    let tui_ch = TUI_CH.init_with(Channel::new);
+    static SHIFT_CH: StaticCell<Channel<NoopRawMutex, (audio::Bank, bool), 1>> = StaticCell::new();
+    let shift_ch = SHIFT_CH.init_with(Channel::new);
+    static ENCODER_SW_CH: StaticCell<Channel<NoopRawMutex, embassy_stm32::gpio::Level, 1>> =
+        StaticCell::new();
+    let encoder_sw_ch = ENCODER_SW_CH.init_with(Channel::new);
+    static ENCODER_CH: StaticCell<Channel<NoopRawMutex, input::digital::Direction, 1>> =
+        StaticCell::new();
+    let encoder_ch = ENCODER_CH.init_with(Channel::new);
 
     // -----------------------------------------------------------------------------
     // --- TUI HANDLER TASK
@@ -149,6 +155,9 @@ async fn main(spawner: Spawner) {
         ssd1306::rotation::DisplayRotation::Rotate0,
     )
     .into_buffered_graphics_mode();
+    // init channel
+    static TUI_CH: StaticCell<Channel<NoopRawMutex, tui::Cmd, 1>> = StaticCell::new();
+    let tui_ch = TUI_CH.init_with(Channel::new);
     spawner.must_spawn(tui::tui_handler(
         tui::TuiHandler::new(),
         display,
@@ -156,8 +165,22 @@ async fn main(spawner: Spawner) {
     ));
 
     // -----------------------------------------------------------------------------
+    // --- ENCODER TASKS
+    let encoder_sw = input::digital::Debounce::new(
+        ExtiInput::new(p.PG11, p.EXTI11, embassy_stm32::gpio::Pull::Up), // D8
+        embassy_time::Duration::from_millis(20),
+    );
+    let ch1 = ExtiInput::new(p.PB4, p.EXTI4, embassy_stm32::gpio::Pull::Up); // D9
+    let ch2 = ExtiInput::new(p.PB5, p.EXTI5, embassy_stm32::gpio::Pull::Up); // D10
+    let encoder = input::digital::Encoder::new(ch1, ch2);
+    spawner.must_spawn(input::digital::encoder_sw(
+        encoder_sw,
+        encoder_sw_ch.dyn_sender(),
+    ));
+    spawner.must_spawn(input::digital::encoder(encoder, encoder_ch.dyn_sender()));
+
+    // -----------------------------------------------------------------------------
     // --- INPUT HANDLER TASK
-    // touch sensors
     let mpr121_irq_a = ExtiInput::new(p.PB6, p.EXTI6, embassy_stm32::gpio::Pull::Up); // D13
     let mpr121_a = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_a)
         .await
@@ -166,56 +189,52 @@ async fn main(spawner: Spawner) {
     let mpr121_b = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_b)
         .await
         .unwrap();
-    // encoder
-    let ch1 = ExtiInput::new(p.PB4, p.EXTI4, embassy_stm32::gpio::Pull::Up); // D9
-    let ch2 = ExtiInput::new(p.PB5, p.EXTI5, embassy_stm32::gpio::Pull::Up); // D10
-    let encoder = input::digital::Encoder::new(ch1, ch2);
-    // switches
-    let scenes_sw = input::digital::Debounce::new(
-        ExtiInput::new(p.PG10, p.EXTI10, embassy_stm32::gpio::Pull::Up), // D7
-        embassy_time::Duration::from_millis(20),
-    );
-    let onsets_sw = input::digital::Debounce::new(
-        ExtiInput::new(p.PG11, p.EXTI11, embassy_stm32::gpio::Pull::Up), // D8
-        embassy_time::Duration::from_millis(20),
-    );
     spawner.must_spawn(input::input(
         input::InputHandler::new(fs.root_dir()),
-        scenes_sw,
-        onsets_sw,
-        encoder,
         mpr121_a,
         mpr121_b,
+        shift_ch.dyn_sender(),
         audio_ch.dyn_sender(),
         tui_ch.dyn_sender(),
+        encoder_sw_ch.dyn_receiver(),
+        encoder_ch.dyn_receiver(),
     ));
 
     // -----------------------------------------------------------------------------
     // --- POTENTIOMETERS TASK
+    let tempo_pot = p.PC0.degrade_adc();
     let pots_a = input::analog::Pots::new(
-        p.PC0, // A0
         p.PA3, // A1
         p.PB1, // A2
         p.PA7, // A3
+    );
+    let thumbstick_a = input::analog::Thumbstick::new(
         p.PA6, // A4
+        p.PC1, // A5
+        true,
     );
     let pots_b = input::analog::Pots::new(
-        p.PC1, // A5
         p.PC4, // A6
         p.PA5, // A7
         p.PA4, // A8
-        p.PA1, // A9
     );
-    let tempo_pot = p.PA0.degrade_adc();
+    let thumbstick_b = input::analog::Thumbstick::new(
+        p.PA1, // A9
+        p.PA0, // A10
+        false,
+    );
     spawner.must_spawn(input::analog::adc(
         embassy_stm32::adc::Adc::new(p.ADC1),
         p.DMA1_CH1,
-        pots_a,
-        pots_b,
         tempo_pot,
+        pots_a,
+        thumbstick_a,
+        pots_b,
+        thumbstick_b,
         clock_ch.dyn_sender(),
         audio_ch.dyn_sender(),
         tui_ch.dyn_sender(),
+        shift_ch.dyn_receiver(),
     ));
 
     // -----------------------------------------------------------------------------
@@ -248,11 +267,11 @@ async fn main(spawner: Spawner) {
     ));
 
     // -----------------------------------------------------------------------------
-    // --- SCENE HANDLER TASK
-    let scene_handler = angry_surgeon_core::SceneHandler::new(audio::STEP_DIV, audio::LOOP_DIV);
-    spawner.must_spawn(audio::scene_handler(
+    // --- SYSTEM HANDLER TASK
+    let system_handler = angry_surgeon_core::SystemHandler::new(audio::STEP_DIV, audio::LOOP_DIV as f32);
+    spawner.must_spawn(audio::system_handler(
         fs.root_dir(),
-        scene_handler,
+        system_handler,
         grain_tx,
         audio_ch.dyn_receiver(),
     ));
@@ -260,7 +279,7 @@ async fn main(spawner: Spawner) {
     // -----------------------------------------------------------------------------
     // --- SAI OUTPUT TASK
     let sai_tx = audio::hw::init_sai_tx(p.SAI1, p.PE5, p.PE4, p.PE2, p.PE6, p.DMA1_CH0);
-    spawner.must_spawn(audio::output(sai_tx, grain_rx));
+    spawner.must_spawn(audio::hw::output(sai_tx, grain_rx));
 
     print!("finished init!");
 }

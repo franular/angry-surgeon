@@ -3,6 +3,7 @@ use embassy_stm32::{
     sai::{Dma, FsPin, Instance, MasterClockDivider, MclkPin, Sai, SckPin, SdPin, A},
     Peri,
 };
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use grounded::uninit::GroundedArrayCell;
 
 pub(super) const HALF_DMA_BUFFER_LEN: usize = super::GRAIN_LEN * 2; // 2 channels
@@ -117,5 +118,24 @@ const fn mclk_div_from_u8(v: u8) -> MasterClockDivider {
         62 => MasterClockDivider::Div62,
         63 => MasterClockDivider::Div63,
         _ => panic!(),
+    }
+}
+
+#[embassy_executor::task]
+pub async fn output(
+    // pull low
+    mut sai_tx: embassy_stm32::sai::Sai<'static, embassy_stm32::peripherals::SAI1, u32>,
+    mut grain_rx: embassy_sync::zerocopy_channel::Receiver<'static, NoopRawMutex, [u16; super::GRAIN_LEN]>,
+) {
+    let mut buf = [0u32; HALF_DMA_BUFFER_LEN];
+    loop {
+        let grain_fut = grain_rx.receive();
+        sai_tx.write(&buf).await.unwrap();
+
+        let grain = grain_fut.await;
+        for i in 0..buf.len() {
+            buf[i] = grain[i] as u32;
+        }
+        grain_rx.receive_done();
     }
 }

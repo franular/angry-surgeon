@@ -141,26 +141,19 @@ pub struct Bank {
     pub phrases: [bool; PAD_COUNT],
 }
 
-#[derive(Default)]
-pub struct Sd {
-    pub banks: [Bank; BANK_COUNT],
-}
-
-impl Sd {
-    pub fn from_audio(sd: &crate::input::Sd) -> Self {
+impl Bank {
+    pub fn from_audio(bank: &crate::input::Bank) -> Self {
         let mut ret = Self::default();
-        for (rbank, wbank) in sd.banks.iter().zip(ret.banks.iter_mut()) {
-            for (rkit, wkit) in rbank.kits.iter().zip(wbank.kits.iter_mut()) {
-                for i in 0..rkit.onsets.len() {
-                    if rkit.onsets[i].is_some() {
-                        wkit.get_or_insert_default().onsets[i] = true;
-                    }
+        for (rkit, wkit) in bank.kits.iter().zip(ret.kits.iter_mut()) {
+            for i in 0..rkit.onsets.len() {
+                if rkit.onsets[i].is_some() {
+                    wkit.get_or_insert_default().onsets[i] = true;
                 }
             }
-            for i in 0..rbank.phrases.len() {
-                if rbank.phrases[i].is_some() {
-                    wbank.phrases[i] = true;
-                }
+        }
+        for i in 0..bank.phrases.len() {
+            if bank.phrases[i].is_some() {
+                ret.phrases[i] = true;
             }
         }
         ret
@@ -169,11 +162,10 @@ impl Sd {
 
 pub enum Cmd {
     Yield,
-    AssignScene(Sd),
     Log(String<COLS>),
-    LoadScene([String<COLS>; FILE_COUNT]),
-    LoadWav([String<COLS>; FILE_COUNT]),
-    AssignOnset {
+    LoadBd([String<COLS>; FILE_COUNT]),
+    LoadRd([String<COLS>; FILE_COUNT]),
+    LoadOnset {
         name: String<COLS>,
         index: usize,
         count: usize,
@@ -184,13 +176,17 @@ pub enum Cmd {
 pub enum BankCmd {
     Pad(u8, bool),
     LoadOnset,
-    AssignGain(u8),
-    AssignWidth(u8),
-    AssignSpeed(u8),
-    AssignPhraseDrift(u8),
-    AssignKitDrift(u8),
+    AssignGain(f32),
+    AssignWidth(f32),
+    AssignSpeed(f32),
+    AssignRoll(f32),
+    AssignKitDrift(f32),
+    AssignPhraseDrift(f32),
+
+    LoadBank(Bank),
     LoadKit(Option<u8>),
     ClearOnset(Option<u8>),
+
     BakeRecord(Option<u8>, u16),
     ClearPool,
     PushPool(Option<u8>),
@@ -198,13 +194,13 @@ pub enum BankCmd {
 
 enum GlobalState {
     Yield,
-    LoadScene {
+    LoadBd {
         paths: [String<COLS>; FILE_COUNT],
     },
-    LoadWav {
+    LoadRd {
         paths: [String<COLS>; FILE_COUNT],
     },
-    AssignOnset {
+    LoadOnset {
         name: String<COLS>,
         index: usize,
         count: usize,
@@ -220,11 +216,12 @@ enum BankState {
 }
 
 struct BankHandler {
-    gain: u8,
-    width: u8,
-    speed: u8,
-    phrase_drift: u8,
-    kit_drift: u8,
+    gain: f32,
+    width: f32,
+    speed: f32,
+    roll: f32,
+    kit_drift: f32,
+    phrase_drift: f32,
     kit_index: usize,
     bank: Bank,
     downs: Vec<u8, PAD_COUNT>,
@@ -235,11 +232,12 @@ struct BankHandler {
 impl BankHandler {
     fn new() -> Self {
         Self {
-            phrase_drift: 0,
-            gain: 0,
-            width: 0,
-            speed: 0,
-            kit_drift: 0,
+            gain: 0.,
+            width: 0.,
+            speed: 0.,
+            roll: 0.,
+            kit_drift: 0.,
+            phrase_drift: 0.,
             kit_index: 0,
             bank: Bank::default(),
             downs: Vec::new(),
@@ -255,10 +253,14 @@ impl BankHandler {
             BankCmd::AssignGain(v) => self.gain = v,
             BankCmd::AssignWidth(v) => self.width = v,
             BankCmd::AssignSpeed(v) => self.speed = v,
+            BankCmd::AssignRoll(v) => self.roll = v,
             BankCmd::AssignPhraseDrift(v) => self.phrase_drift = v,
             BankCmd::AssignKitDrift(v) => self.kit_drift = v,
+
+            BankCmd::LoadBank(bank) => self.bank = bank,
             BankCmd::LoadKit(index) => self.load_kit(index),
             BankCmd::ClearOnset(index) => self.clear_onset(index),
+
             BankCmd::BakeRecord(index, len) => self.state = BankState::BakeRecord { index, len },
             BankCmd::PushPool(index) => self.push_pool(index),
             BankCmd::ClearPool => self.pool.clear(),
@@ -334,11 +336,12 @@ impl BankHandler {
         if let Some(index) = self.downs.first() {
             pads[*index as usize] = b'@';
         }
-        text[1] = Some(Text::base(format6!(b' ', "g: {:03}", self.gain)));
-        text[2] = Some(Text::base(format6!(b' ', "w: {:03}", self.width)));
-        text[3] = Some(Text::base(format6!(b' ', "s: {:03}", self.speed)));
-        text[4] = Some(Text::base(format6!(b' ', "p: {:03}", self.phrase_drift)));
-        text[5] = Some(Text::base(format6!(b' ', "k: {:03}", self.kit_drift)));
+        text[0] = Some(Text::base(format6!(b' ', "g {:04}", self.gain)));
+        text[1] = Some(Text::base(format6!(b' ', "w {:04}", self.width)));
+        text[2] = Some(Text::base(format6!(b' ', "s {:04}", self.speed)));
+        text[3] = Some(Text::base(format6!(b' ', "r {:04}", self.roll)));
+        text[4] = Some(Text::base(format6!(b' ', "k {:04}", self.kit_drift)));
+        text[5] = Some(Text::base(format6!(b' ', "p {:04}", self.phrase_drift)));
         write_pads!(text, pads);
     }
 
@@ -436,19 +439,14 @@ impl TuiHandler {
                     bank.state = BankState::LoadOnset;
                 }
             }
-            Cmd::AssignScene(sd) => {
-                for (rbank, wbank) in sd.banks.into_iter().zip(self.banks.iter_mut()) {
-                    wbank.bank = rbank;
-                }
-            }
-            Cmd::LoadScene(paths) => self.state = GlobalState::LoadScene { paths },
-            Cmd::LoadWav(paths) => self.state = GlobalState::LoadWav { paths },
-            Cmd::AssignOnset { name, index, count } => {
-                self.state = GlobalState::AssignOnset { name, index, count }
+            Cmd::LoadBd(paths) => self.state = GlobalState::LoadBd { paths },
+            Cmd::LoadRd(paths) => self.state = GlobalState::LoadRd { paths },
+            Cmd::LoadOnset { name, index, count } => {
+                self.state = GlobalState::LoadOnset { name, index, count }
             }
             Cmd::Bank(bank, cmd) => {
                 if let BankCmd::Pad(index, true) = cmd {
-                    if let GlobalState::AssignOnset { .. } = self.state {
+                    if let GlobalState::LoadOnset { .. } = self.state {
                         let kit_index = self.banks[bank as u8 as usize].kit_index;
                         self.banks[bank as u8 as usize].bank.kits[kit_index]
                             .get_or_insert_default()
@@ -490,9 +488,9 @@ impl TuiHandler {
             let mut lines = core::array::from_fn(|_| None);
             match &self.state {
                 GlobalState::Yield => unreachable!(),
-                GlobalState::LoadScene { paths } => self.render_load_scene(&mut lines, paths),
-                GlobalState::LoadWav { paths } => self.render_load_wav(&mut lines, paths),
-                GlobalState::AssignOnset { name, index, count } => {
+                GlobalState::LoadBd { paths } => self.render_load_bd(&mut lines, paths),
+                GlobalState::LoadRd { paths } => self.render_load_rd(&mut lines, paths),
+                GlobalState::LoadOnset { name, index, count } => {
                     self.render_assign_onset(&mut lines, name, *index, *count)
                 }
             };
@@ -526,7 +524,7 @@ impl TuiHandler {
         }
     }
 
-    fn render_load_scene(&self, text: &mut [Option<Text<14>>; ROWS], paths: &[String<COLS>]) {
+    fn render_load_bd(&self, text: &mut [Option<Text<14>>; ROWS], paths: &[String<COLS>]) {
         let pads: [[u8; PAD_COUNT]; BANK_COUNT] = core::array::from_fn(|i| {
             let mut ret = core::array::from_fn(|j| {
                 if self.banks[i].downs.contains(&(j as u8)) {
@@ -542,7 +540,7 @@ impl TuiHandler {
             }
             ret
         });
-        text[0] = Some(Text::base(format14!(1, "load scene")));
+        text[0] = Some(Text::base(format14!(1, "load bank")));
         for i in 0..paths.len() {
             text[1 + i] = Some(Text::base(format14!(b' ', "{}", paths[i])));
         }
@@ -550,7 +548,7 @@ impl TuiHandler {
         write_pads!(text, pads[0], pads[1]);
     }
 
-    fn render_load_wav(&self, text: &mut [Option<Text<14>>; ROWS], paths: &[String<COLS>]) {
+    fn render_load_rd(&self, text: &mut [Option<Text<14>>; ROWS], paths: &[String<COLS>]) {
         let pads: [[u8; PAD_COUNT]; BANK_COUNT] = core::array::from_fn(|i| {
             let mut ret = core::array::from_fn(|j| {
                 if self.banks[i].downs.contains(&(j as u8)) {

@@ -74,6 +74,7 @@ enum Regs {
 pub struct Mpr121<'d, I: I2c> {
     i2c: I,
     exti: ExtiInput<'d>,
+    touched: bool,
 }
 
 impl<'d, I: I2c> Mpr121<'d, I> {
@@ -125,11 +126,21 @@ impl<'d, I: I2c> Mpr121<'d, I> {
         // enable 12 electrodes & start
         write_byte!(i2c, ECR, 0b10000000 + 12);
 
-        Ok(Self { i2c, exti })
+        Ok(Self {
+            i2c,
+            exti,
+            touched: false,
+        })
     }
 
     pub async fn wait_for_touched(&mut self) -> Result<u16, Error<I::Error>> {
-        self.exti.wait_for_falling_edge().await;
+        if self.touched {
+            self.exti.wait_for_high().await;
+            self.touched = false;
+        }
+        self.exti.wait_for_low().await;
+        self.touched = true;
+
         let mut buf = [0u8; 2];
         self.i2c
             .write_read(ADDR, &[Regs::TOUCHSTATUS_L as u8], &mut buf)
