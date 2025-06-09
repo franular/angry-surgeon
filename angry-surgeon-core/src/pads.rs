@@ -303,13 +303,13 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, IO: Read + Wri
                     channels,
                 )
                 .await;
-            } else if let active::Event::Loop(onset, _, len) = active {
+            } else if let active::Event::Loop(onset, _, num) = active {
                 let wav = &mut onset.wav;
                 let pos = wav.pos().await?;
                 let len = if let Some(steps) = wav.steps {
-                    (f32::from(*len) * wav.len as f32 / steps as f32) as u64 & !1
+                    (*num as f32 / self.loop_div.net() * wav.len as f32 / steps as f32) as u64 & !1
                 } else {
-                    (f32::from(*len) * SAMPLE_RATE as f32 * 60. / self.tempo * self.loop_div.net())
+                    (*num as f32 / self.loop_div.net() * SAMPLE_RATE as f32 * 60. / self.tempo * self.loop_div.net())
                         as u64
                         & !1
                 };
@@ -429,12 +429,12 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, IO: Read + Wri
                             wav.seek(onset.start as i64 + offset).await?;
                         }
                     }
-                    active::Event::Loop(onset, step, len) => {
+                    active::Event::Loop(onset, step, num) => {
                         let wav = &mut onset.wav;
                         if let Some(steps) = wav.steps {
                             let clock = self.reverse.unwrap_or(self.clock);
                             let offset = (wav.len as f32 / steps as f32
-                                * ((clock - *step as f32).rem_euclid(f32::from(*len))))
+                                * ((clock - *step as f32).rem_euclid(*num as f32 / self.loop_div.net())))
                                 as i64
                                 & !1;
                             wav.seek(onset.start as i64 + offset).await?;

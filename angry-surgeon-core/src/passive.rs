@@ -37,7 +37,7 @@ pub struct Onset {
 pub enum Event {
     Sync,
     Hold { index: u8 },
-    Loop { index: u8, len: super::Fraction },
+    Loop { index: u8, len: u16 },
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

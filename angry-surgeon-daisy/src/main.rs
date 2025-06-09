@@ -1,3 +1,4 @@
+#![allow(unused)]
 #![no_std]
 #![no_main]
 
@@ -14,7 +15,7 @@ use embassy_stm32::{exti::ExtiInput, time::Hertz};
 use embassy_sync::zerocopy_channel::Channel as ZeroCopyChannel;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+use panic_halt as _;
 
 extern crate alloc;
 
@@ -33,7 +34,7 @@ async fn main(spawner: Spawner) {
     // init allocator
     {
         use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 65535;
+        const HEAP_SIZE: usize = 8192;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         #[allow(static_mut_refs)]
         unsafe {
@@ -97,9 +98,19 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(serial::serial(usb, class, serial::CHANNEL.dyn_receiver()));
 
     // init sd filesystem
-    let sdmmc = fs::hw::init_sdmmc(p.SDMMC1, Irqs, p.PC12, p.PD2, p.PC8, p.PC9, p.PC10, p.PC11)
-        .await
-        .unwrap();
+    let sdmmc = fs::hw::init_sdmmc(
+        p.SDMMC1,
+        Irqs,
+        p.PC12, // D6
+        p.PD2,  // D5
+        p.PC8,  // D4
+        p.PC9,  // D3
+        p.PC10, // D2
+        p.PC11, // D1
+    )
+    .await
+    .unwrap();
+
     let fs_options = embedded_fatfs::FsOptions::new();
     static FS: StaticCell<fs::hw::FileSystem> = StaticCell::new();
     let fs = FS.init_with(|| {
@@ -109,8 +120,8 @@ async fn main(spawner: Spawner) {
     // init i2c1
     let i2c = embassy_stm32::i2c::I2c::new(
         p.I2C1,
-        p.PB8,
-        p.PB9,
+        p.PB8, // D11
+        p.PB9, // D12
         Irqs,
         p.DMA1_CH2,
         p.DMA1_CH3,
@@ -182,11 +193,11 @@ async fn main(spawner: Spawner) {
     // -----------------------------------------------------------------------------
     // --- INPUT HANDLER TASK
     let mpr121_irq_a = ExtiInput::new(p.PB6, p.EXTI6, embassy_stm32::gpio::Pull::Up); // D13
-    let mpr121_a = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_a)
+    let mpr121_a = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_a, 0x5a) // ADDR to GND
         .await
         .unwrap();
     let mpr121_irq_b = ExtiInput::new(p.PB7, p.EXTI7, embassy_stm32::gpio::Pull::Up); // D14
-    let mpr121_b = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_b)
+    let mpr121_b = input::touch::Mpr121::new(i2c_bus.get_ref(), mpr121_irq_b, 0x5c) // ADDR to SDA
         .await
         .unwrap();
     spawner.must_spawn(input::input(
@@ -239,7 +250,7 @@ async fn main(spawner: Spawner) {
 
     // -----------------------------------------------------------------------------
     // --- CLOCK I/O TASK
-    let ground_in = input::digital::Debounce::new(
+    let clock_sw = input::digital::Debounce::new(
         ExtiInput::new(p.PG9, p.EXTI9, embassy_stm32::gpio::Pull::Up), // D27
         embassy_time::Duration::from_millis(20),
     );
@@ -253,12 +264,12 @@ async fn main(spawner: Spawner) {
         embassy_stm32::gpio::Speed::VeryHigh,
     );
     let tempo_led = embassy_stm32::gpio::Output::new(
-        p.PC7, // user led
+        p.PB14, // D29
         embassy_stm32::gpio::Level::Low,
         embassy_stm32::gpio::Speed::High,
     );
     spawner.must_spawn(input::digital::clock(
-        ground_in,
+        clock_sw,
         clock_in,
         clock_out,
         tempo_led,
@@ -268,7 +279,7 @@ async fn main(spawner: Spawner) {
 
     // -----------------------------------------------------------------------------
     // --- SYSTEM HANDLER TASK
-    let system_handler = angry_surgeon_core::SystemHandler::new(audio::STEP_DIV, audio::LOOP_DIV as f32);
+    let system_handler = angry_surgeon_core::SystemHandler::new(audio::STEP_DIV, 8.);
     spawner.must_spawn(audio::system_handler(
         fs.root_dir(),
         system_handler,
@@ -282,4 +293,14 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(audio::hw::output(sai_tx, grain_rx));
 
     print!("finished init!");
+
+    let mut led = embassy_stm32::gpio::Output::new(
+        p.PC7, // user led
+        embassy_stm32::gpio::Level::Low,
+        embassy_stm32::gpio::Speed::High,
+    );
+    loop {
+        led.toggle();
+        embassy_time::Timer::after_secs(1).await;
+    }
 }

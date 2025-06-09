@@ -67,7 +67,7 @@ struct Disconnected {}
 impl From<embassy_usb::driver::EndpointError> for Disconnected {
     fn from(val: embassy_usb::driver::EndpointError) -> Self {
         match val {
-            embassy_usb::driver::EndpointError::BufferOverflow => defmt::panic!("buffer overflow"),
+            embassy_usb::driver::EndpointError::BufferOverflow => panic!("buffer overflow"),
             embassy_usb::driver::EndpointError::Disabled => Disconnected {},
         }
     }
@@ -84,8 +84,8 @@ pub fn init_usb_class<'d, T: Instance>(
     config.vbus_detection = false;
     let driver =
         embassy_stm32::usb::Driver::new_fs(_instance, _irq, dp, dm, &mut serial.ep_out_buf, config);
-    let mut config = embassy_usb::Config::new(0xf2aa, 0xaaaa);
-    config.manufacturer = Some("more bpm");
+    let mut config = embassy_usb::Config::new(0x4652, 0x414e);
+    config.manufacturer = Some("franular");
     config.product = Some("angry surgeon");
 
     let mut builder = embassy_usb::Builder::<Driver<'d, T>>::new(

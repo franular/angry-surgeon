@@ -185,7 +185,6 @@ pub enum BankCmd {
 
     LoadBank(Bank),
     LoadKit(Option<u8>),
-    ClearOnset(Option<u8>),
 
     BakeRecord(Option<u8>, u16),
     ClearPool,
@@ -210,7 +209,6 @@ enum GlobalState {
 enum BankState {
     LoadOnset,
     LoadKit { index: Option<u8> },
-    ClearOnset { index: Option<u8> },
     BakeRecord { index: Option<u8>, len: u16 },
     PushPool { index: Option<u8> },
 }
@@ -259,7 +257,6 @@ impl BankHandler {
 
             BankCmd::LoadBank(bank) => self.bank = bank,
             BankCmd::LoadKit(index) => self.load_kit(index),
-            BankCmd::ClearOnset(index) => self.clear_onset(index),
 
             BankCmd::BakeRecord(index, len) => self.state = BankState::BakeRecord { index, len },
             BankCmd::PushPool(index) => self.push_pool(index),
@@ -295,15 +292,6 @@ impl BankHandler {
         self.state = BankState::LoadKit { index };
     }
 
-    fn clear_onset(&mut self, index: Option<u8>) {
-        if let Some(index) = index {
-            if let Some(kit) = &mut self.bank.kits[self.kit_index] {
-                kit.onsets[index as usize] = false;
-            }
-        }
-        self.state = BankState::ClearOnset { index };
-    }
-
     fn push_pool(&mut self, index: Option<u8>) {
         if let Some(index) = index {
             if self.bank.phrases[index as usize] {
@@ -318,7 +306,6 @@ impl BankHandler {
         match self.state {
             BankState::LoadOnset => self.render_load_onset(&mut text),
             BankState::LoadKit { index } => self.render_load_kit(&mut text, index),
-            BankState::ClearOnset { index } => self.render_clear_onset(&mut text, index),
             BankState::BakeRecord { index, len } => self.render_bake_record(&mut text, index, len),
             BankState::PushPool { index } => self.render_push_pool(&mut text, index),
         }
@@ -357,24 +344,6 @@ impl BankHandler {
             pads[index as usize] = b'@';
         }
         text[0] = Some(Text::base(format6!(1, "kit")));
-        write_pads!(text, pads);
-    }
-
-    fn render_clear_onset(&self, text: &mut [Option<Text<6>>; ROWS], index: Option<u8>) {
-        let mut pads: [u8; PAD_COUNT] = core::array::from_fn(|i| {
-            if self.bank.kits[self.kit_index]
-                .as_ref()
-                .is_some_and(|v| v.onsets[i])
-            {
-                b'o'
-            } else {
-                b' '
-            }
-        });
-        if let Some(index) = index {
-            pads[index as usize] = b'@';
-        }
-        text[0] = Some(Text::base(format6!(1, "clear")));
         write_pads!(text, pads);
     }
 
@@ -622,18 +591,18 @@ pub async fn tui_handler(
 
     display.init().await.unwrap();
     loop {
-        // render display
-        display.clear_buffer();
-        tui_hdlr.render(&mut display).await;
-        display.flush().await.unwrap();
-        // parse cmd
-        if let Some((ticker, _)) = &mut tui_hdlr.log {
-            match select(ticker.next(), cmd_rx.receive()).await {
-                Either::First(()) => tui_hdlr.log = None,
-                Either::Second(cmd) => tui_hdlr.parse(cmd),
-            }
-        } else {
-            tui_hdlr.parse(cmd_rx.receive().await);
-        }
+         // render display
+         display.clear_buffer();
+         tui_hdlr.render(&mut display).await;
+         display.flush().await.unwrap();
+         // parse cmd
+         if let Some((ticker, _)) = &mut tui_hdlr.log {
+             match select(ticker.next(), cmd_rx.receive()).await {
+                 Either::First(()) => tui_hdlr.log = None,
+                 Either::Second(cmd) => tui_hdlr.parse(cmd),
+             }
+         } else {
+             tui_hdlr.parse(cmd_rx.receive().await);
+         }
     }
 }

@@ -15,7 +15,6 @@ pub const MAX_PHRASE_LEN: usize = 2usize.pow(PAD_COUNT as u32 - 1);
 pub const PPQ: u16 = 2;
 /// steps per quarter
 pub const STEP_DIV: u16 = 4;
-pub const LOOP_DIV: u16 = 8;
 
 #[derive(Copy, Clone)]
 pub enum Bank {
@@ -25,7 +24,6 @@ pub enum Bank {
 
 pub enum Cmd<'d> {
     Clock,
-    Stop,
     AssignTempo(f32),
     Bank(Bank, BankCmd<'d>),
 }
@@ -44,7 +42,6 @@ pub enum BankCmd<'d> {
     SaveBank(embassy_sync::channel::DynamicSender<'d, crate::input::Bank>),
     LoadBank(embassy_sync::channel::DynamicReceiver<'d, crate::input::Bank>),
     LoadKit(u8),
-    ClearOnset(u8),
     AssignOnset(u8, Onset),
 
     ForceEvent(Event),
@@ -69,7 +66,6 @@ async fn parse_cmd<'d>(
 ) -> Result<(), <File<'d> as embedded_io_async::ErrorType>::Error> {
     match cmd {
         Cmd::Clock => sys_hdlr.tick(fs, rand).await?,
-        Cmd::Stop => sys_hdlr.stop(),
         Cmd::AssignTempo(v) => sys_hdlr.assign_tempo(v),
         Cmd::Bank(bank, cmd) => {
             let bank_hdlr = &mut sys_hdlr.banks[bank as u8 as usize];
@@ -87,9 +83,6 @@ async fn parse_cmd<'d>(
                 BankCmd::SaveBank(tx) => tx.send(bank_hdlr.bank.clone()).await,
                 BankCmd::LoadBank(rx) => bank_hdlr.bank = rx.receive().await,
                 BankCmd::LoadKit(index) => bank_hdlr.kit_index = index as usize,
-                BankCmd::ClearOnset(index) => {
-                    bank_hdlr.bank.kits[bank_hdlr.kit_index].onsets[index as usize] = None
-                }
                 BankCmd::AssignOnset(index, onset) => {
                     bank_hdlr.assign_onset(fs, rand, index, onset).await?
                 }

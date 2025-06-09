@@ -5,7 +5,7 @@ use crate::{
     fs::hw::Dir,
     tui,
 };
-use angry_surgeon_core::{Event, Fraction, Onset, Wav};
+use angry_surgeon_core::{Event, Onset, Wav};
 use embassy_stm32::gpio::Level;
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex,
@@ -173,7 +173,6 @@ enum GlobalState {
 enum BankState {
     LoadOnset,
     LoadKit,
-    ClearOnset,
     BakeRecord,
     BuildPool { cleared: bool },
 }
@@ -305,8 +304,8 @@ impl BankHandler {
 
     async fn kit_up(&mut self, tui_tx: &DynamicSender<'_, tui::Cmd>) {
         match self.state {
-            BankState::LoadKit | BankState::ClearOnset => {
-                // exit load kit/clear onset
+            BankState::LoadKit => {
+                // exit load kit
                 self.state = BankState::LoadOnset;
                 tui_tx.send(tui_bank_cmd!(self.bank, LoadOnset)).await;
             }
@@ -375,18 +374,6 @@ impl BankHandler {
                     ))
                     .await;
             }
-            BankState::ClearOnset => {
-                audio_tx
-                    .send(audio_bank_cmd!(self.bank, ClearOnset, self.downs[0]))
-                    .await;
-                tui_tx
-                    .send(tui_bank_cmd!(
-                        self.bank,
-                        ClearOnset,
-                        self.downs.first().copied()
-                    ))
-                    .await;
-            }
             BankState::BakeRecord => {
                 let len = if self.downs.len() > 1 {
                     self.binary_offset(self.downs[0])
@@ -433,8 +420,7 @@ impl BankHandler {
         if let Some(&index) = self.downs.first() {
             if self.downs.len() > 1 {
                 // init loop start
-                let numerator = self.binary_offset(index);
-                let len = Fraction::new(numerator, audio::LOOP_DIV);
+                let len = self.binary_offset(index);
                 audio_tx
                     .send(audio_bank_cmd!(
                         self.bank,

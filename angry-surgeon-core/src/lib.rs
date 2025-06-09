@@ -27,24 +27,3 @@ pub trait FileHandler {
         file: &Self::File,
     ) -> impl Future<Output = Result<Self::File, <Self::File as embedded_io_async::ErrorType>::Error>>;
 }
-
-#[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Fraction {
-    numerator: u16,
-    denominator: u16,
-}
-
-impl Fraction {
-    pub fn new(numerator: u16, denominator: u16) -> Self {
-        Self {
-            numerator,
-            denominator,
-        }
-    }
-}
-
-impl From<Fraction> for f32 {
-    fn from(value: Fraction) -> Self {
-        value.numerator as f32 / value.denominator as f32
-    }
-}

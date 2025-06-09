@@ -112,7 +112,7 @@ pub async fn encoder(mut encoder: Encoder<'static>, tx: DynamicSender<'static, D
 
 #[embassy_executor::task]
 pub async fn clock(
-    mut ground_in: Debounce<'static>,
+    mut clock_sw: Debounce<'static>,
     mut clock_in: Debounce<'static>,
     clock_out: embassy_stm32::gpio::Output<'static>,
     tempo_led: embassy_stm32::gpio::Output<'static>,
@@ -139,7 +139,7 @@ pub async fn clock(
 
     loop {
         match select6(
-            ground_in.wait_for_any_edge(),
+            clock_sw.wait_for_any_edge(),
             clock_in.wait_for_any_edge(),
             clock_rx.receive(),
             embassy_time::Timer::at(last_step + beat_dur / STEP_DIV as u32),

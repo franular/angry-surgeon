@@ -2,19 +2,18 @@ use embassy_stm32::exti::ExtiInput;
 use embedded_hal_async::i2c::I2c;
 
 macro_rules! write_byte {
-    ($i2c:expr,$addr:ident,$offset:expr,$byte:expr) => {{
-        $i2c.write(ADDR, &[Regs::$addr as u8 + $offset, $byte])
+    ($i2c:expr,$i2c_addr:expr,$mem_addr:ident,$offset:expr,$byte:expr) => {{
+        $i2c.write($i2c_addr, &[Regs::$mem_addr as u8 + $offset, $byte])
             .await?;
         // rise/fall time
         embassy_time::Timer::after_nanos(DELAY).await;
     }};
-    ($i2c:expr,$addr:ident,$byte:expr) => {
-        write_byte!($i2c, $addr, 0, $byte);
+    ($i2c:expr,$i2c_addr:expr,$mem_addr:ident,$byte:expr) => {
+        write_byte!($i2c, $i2c_addr, $mem_addr, 0, $byte);
     };
 }
 
 const DELAY: u64 = 300;
-const ADDR: u8 = 0x5a;
 const TOUCH_THRESH: u8 = 12;
 const RELEASE_THRESH: u8 = 6;
 
@@ -74,18 +73,19 @@ enum Regs {
 pub struct Mpr121<'d, I: I2c> {
     i2c: I,
     exti: ExtiInput<'d>,
+    addr: u8,
     touched: bool,
 }
 
 impl<'d, I: I2c> Mpr121<'d, I> {
-    pub async fn new(mut i2c: I, exti: ExtiInput<'d>) -> Result<Self, Error<I::Error>> {
+    pub async fn new(mut i2c: I, exti: ExtiInput<'d>, addr: u8) -> Result<Self, Error<I::Error>> {
         // reset & stop
-        write_byte!(i2c, SOFTRESET, 0x63);
-        write_byte!(i2c, ECR, 0x00);
+        write_byte!(i2c, addr, SOFTRESET, 0x63);
+        write_byte!(i2c, addr, ECR, 0x00);
 
         // check boot state
         let mut buf = [0u8];
-        i2c.write_read(ADDR, &[Regs::CONFIG2 as u8], &mut buf)
+        i2c.write_read(addr, &[Regs::CONFIG2 as u8], &mut buf)
             .await?;
         if buf[0] != 0x24 {
             crate::print!("e", buf[0] as u32);
@@ -94,42 +94,43 @@ impl<'d, I: I2c> Mpr121<'d, I> {
 
         // set thresholds
         for i in 0..12u8 {
-            write_byte!(i2c, TOUCHTH_0, 2 * i, TOUCH_THRESH);
-            write_byte!(i2c, RELEASETH_0, 2 * i, RELEASE_THRESH);
+            write_byte!(i2c, addr, TOUCHTH_0, 2 * i, TOUCH_THRESH);
+            write_byte!(i2c, addr, RELEASETH_0, 2 * i, RELEASE_THRESH);
         }
 
         // set filters
-        write_byte!(i2c, MHDR, 0x01);
-        write_byte!(i2c, NHDR, 0x01);
-        write_byte!(i2c, NCLR, 0x0e);
-        write_byte!(i2c, FDLR, 0x00);
+        write_byte!(i2c, addr, MHDR, 0x01);
+        write_byte!(i2c, addr, NHDR, 0x01);
+        write_byte!(i2c, addr, NCLR, 0x0e);
+        write_byte!(i2c, addr, FDLR, 0x00);
 
-        write_byte!(i2c, MHDF, 0x01);
-        write_byte!(i2c, NHDF, 0x05);
-        write_byte!(i2c, NCLF, 0x01);
-        write_byte!(i2c, FDLF, 0x00);
+        write_byte!(i2c, addr, MHDF, 0x01);
+        write_byte!(i2c, addr, NHDF, 0x05);
+        write_byte!(i2c, addr, NCLF, 0x01);
+        write_byte!(i2c, addr, FDLF, 0x00);
 
-        write_byte!(i2c, NHDT, 0x00);
-        write_byte!(i2c, NCLT, 0x00);
-        write_byte!(i2c, FDLT, 0x00);
+        write_byte!(i2c, addr, NHDT, 0x00);
+        write_byte!(i2c, addr, NCLT, 0x00);
+        write_byte!(i2c, addr, FDLT, 0x00);
 
-        write_byte!(i2c, DEBOUNCE, 0x00);
-        write_byte!(i2c, CONFIG1, 0x10); // default 16uA charge current
-        write_byte!(i2c, CONFIG2, 0x20); // 0.5us encoding, 1ms period
+        write_byte!(i2c, addr, DEBOUNCE, 0x00);
+        write_byte!(i2c, addr, CONFIG1, 0x10); // default 16uA charge current
+        write_byte!(i2c, addr, CONFIG2, 0x20); // 0.5us encoding, 1ms period
 
         // autoconfig for Vdd = 3.3V
-        write_byte!(i2c, AUTOCONFIG0, 0x0b);
-        write_byte!(i2c, UPLIMIT, 200); // (Vdd - 0.7) / Vdd * 256
-        write_byte!(i2c, TARGETLIMIT, 180); // UPLIMIT * 0.9
-        write_byte!(i2c, LOWLIMIT, 130); // UPLIMIT * 0.65
+        write_byte!(i2c, addr, AUTOCONFIG0, 0x0b);
+        write_byte!(i2c, addr, UPLIMIT, 200); // (Vdd - 0.7) / Vdd * 256
+        write_byte!(i2c, addr, TARGETLIMIT, 180); // UPLIMIT * 0.9
+        write_byte!(i2c, addr, LOWLIMIT, 130); // UPLIMIT * 0.65
 
         // enable 12 electrodes & start
-        write_byte!(i2c, ECR, 0b10000000 + 12);
+        write_byte!(i2c, addr, ECR, 0b10000000 + 12);
 
         Ok(Self {
             i2c,
             exti,
             touched: false,
+            addr,
         })
     }
 
@@ -143,7 +144,7 @@ impl<'d, I: I2c> Mpr121<'d, I> {
 
         let mut buf = [0u8; 2];
         self.i2c
-            .write_read(ADDR, &[Regs::TOUCHSTATUS_L as u8], &mut buf)
+            .write_read(self.addr, &[Regs::TOUCHSTATUS_L as u8], &mut buf)
             .await?;
         // embassy_time::Timer::after_nanos(DELAY).await;
         Ok(u16::from_le_bytes(buf) & 0x0fff)

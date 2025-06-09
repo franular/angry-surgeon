@@ -93,9 +93,10 @@ pub async fn init_sdmmc<'d, T: Instance>(
 ) -> Result<StreamSlice<BufStream<Sdmmc<'d, T>, 512>>, InitError> {
     let mut sdmmc = Sdmmc::new_4bit(instance, _irq, clk, cmd, d0, d1, d2, d3, Default::default());
     sdmmc
-        .init_sd_card(embassy_stm32::time::Hertz::mhz(25))
-        .await
-        .unwrap();
+        .init_sd_card(embassy_stm32::time::Hertz::mhz(25), || async { crate::print!("pshew!") })
+        .await;
+    crate::print!("clock: ", sdmmc.clock().0);
+        // .unwrap();
 
     let mut stream = BufStream::new(sdmmc);
     let mut buf = [0u8; 8];

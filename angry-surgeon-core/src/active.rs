@@ -43,7 +43,7 @@ pub struct Onset<IO: Read + Write + Seek> {
 pub enum Event<IO: Read + Write + Seek> {
     Sync,
     Hold(Onset<IO>, u16),
-    Loop(Onset<IO>, u16, crate::Fraction),
+    Loop(Onset<IO>, u16, u16),
 }
 
 impl<IO: Read + Write + Seek> Event<IO> {
