@@ -2,7 +2,6 @@
 
 use crate::{pads, passive, FileHandler};
 use core::mem::MaybeUninit;
-use embedded_io_async::{Read, Seek, Write};
 use heapless::{Deque, Vec};
 use tinyrand::Rand;
 
@@ -10,45 +9,44 @@ use tinyrand::Rand;
 #[allow(unused_imports)]
 use micromath::F32Ext;
 
-pub struct Wav<IO: Read + Write + Seek> {
+pub struct Wav<F: FileHandler> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
-    pub file: IO,
+    pub file: F::File,
     pub len: u64,
 }
 
-impl<IO: Read + Write + Seek> Wav<IO> {
-    pub async fn pos(&mut self) -> Result<u64, IO::Error> {
-        Ok(self.file.stream_position().await? - 44)
+impl<F: FileHandler> Wav<F> {
+    pub fn pos(&mut self, fs: &mut F) -> Result<u64, F::Error> {
+        Ok(fs.stream_position(&self.file)? - 44)
     }
 
-    pub async fn seek(&mut self, offset: i64) -> Result<(), IO::Error> {
-        self.file
-            .seek(embedded_io_async::SeekFrom::Start(
-                44 + (offset.rem_euclid(self.len as i64) as u64),
-            ))
-            .await?;
+    pub fn seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
+        fs.seek(
+            &self.file,
+            embedded_io::SeekFrom::Start(44 + offset.rem_euclid(self.len as i64) as u64),
+        )?;
         Ok(())
     }
 }
 
-pub struct Onset<IO: Read + Write + Seek> {
+pub struct Onset<F: FileHandler> {
     /// source onset index
     pub index: u8,
     pub pan: f32,
-    pub wav: Wav<IO>,
+    pub wav: Wav<F>,
     pub start: u64,
 }
 
-pub enum Event<IO: Read + Write + Seek> {
+pub enum Event<F: FileHandler> {
     Sync,
-    Hold(Onset<IO>, u16),
-    Loop(Onset<IO>, u16, u16),
+    Hold(Onset<F>, u16),
+    Loop(Onset<F>, u16, u16),
 }
 
-impl<IO: Read + Write + Seek> Event<IO> {
+impl<F: FileHandler> Event<F> {
     #[allow(clippy::too_many_arguments)]
-    pub async fn trans<const PADS: usize, const STEPS: usize>(
+    pub fn trans<const PADS: usize, const STEPS: usize>(
         &mut self,
         input: &passive::Event,
         step: u16,
@@ -56,54 +54,81 @@ impl<IO: Read + Write + Seek> Event<IO> {
         kit_index: usize,
         kit_drift: f32,
         rand: &mut impl Rand,
-        fs: &mut impl FileHandler<File = IO>,
-    ) -> Result<(), IO::Error> {
+        fs: &mut F,
+    ) -> Result<(), F::Error> {
         match input {
             passive::Event::Sync => {
+                if let Event::Hold(onset, ..) | Event::Loop(onset, ..) = self {
+                    // close old file
+                    fs.close(&onset.wav.file)?;
+                }
                 *self = Event::Sync;
             }
             passive::Event::Hold { index } => {
-                if let Event::Loop(onset, ..) = self {
-                    // recast event variant with same Onset
-                    let uninit: &mut MaybeUninit<Onset<IO>> =
-                        unsafe { core::mem::transmute(onset) };
-                    let mut onset =
-                        unsafe { core::mem::replace(uninit, MaybeUninit::uninit()).assume_init() };
-                    // i don't know either, girl
-                    onset.wav.file = fs.try_clone(&onset.wav.file).await?;
-                    *self = Event::Hold(onset, step);
-                } else {
-                    let kit = bank.generate_kit(kit_index, kit_drift, rand);
-                    if let Some(onset) = kit
-                        .onset_seek(*index, pads::Kit::<PADS>::generate_pan(*index), fs)
-                        .await?
-                    {
-                        *self = Event::Hold(onset, step);
-                    }
-                }
-            }
-            passive::Event::Loop { index, len } => {
                 match self {
-                    Event::Hold(onset, step) | Event::Loop(onset, step, ..)
-                        if onset.index == *index =>
-                    {
+                    Event::Loop(onset, ..) => {
                         // recast event variant with same Onset
-                        let uninit: &mut MaybeUninit<Onset<IO>> =
+                        let uninit: &mut MaybeUninit<Onset<F>> =
                             unsafe { core::mem::transmute(onset) };
                         let mut onset = unsafe {
                             core::mem::replace(uninit, MaybeUninit::uninit()).assume_init()
                         };
                         // i don't know either, girl
-                        onset.wav.file = fs.try_clone(&onset.wav.file).await?;
-                        *self = Event::Loop(onset, *step, *len);
+                        onset.wav.file = fs.try_clone(&onset.wav.file)?;
+                        *self = Event::Hold(onset, step);
+                    }
+                    Event::Hold(onset, ..) => {
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // close old file and replace onset
+                            if let Some(new) =
+                                kit.onset_seek(Some(&onset.wav.file), *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
+                            {
+                                *self = Event::Hold(new, step);
+                            }
+                        }
                     }
                     _ => {
-                        let kit = bank.generate_kit(kit_index, kit_drift, rand);
-                        if let Some(onset) = kit
-                            .onset(*index, pads::Kit::<PADS>::generate_pan(*index), fs)
-                            .await?
-                        {
-                            *self = Event::Loop(onset, step, *len);
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // replace onset; no old file to close
+                            if let Some(onset) =
+                                kit.onset_seek(None, *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
+                            {
+                                *self = Event::Hold(onset, step);
+                            }
+                        }
+                    }
+                }
+            }
+            passive::Event::Loop { index, len } => {
+                match self {
+                    Event::Hold(onset, step) | Event::Loop(onset, step, ..) => {
+                        if onset.index == *index {
+                            // recast event variant with same Onset
+                            let uninit: &mut MaybeUninit<Onset<F>> =
+                                unsafe { core::mem::transmute(onset) };
+                            let mut onset = unsafe {
+                                core::mem::replace(uninit, MaybeUninit::uninit()).assume_init()
+                            };
+                            // i don't know either, girl
+                            onset.wav.file = fs.try_clone(&onset.wav.file)?;
+                            *self = Event::Loop(onset, *step, *len);
+                        } else if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // close old file and replace onset
+                            if let Some(new) =
+                                kit.onset(Some(&onset.wav.file), *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
+                            {
+                                *self = Event::Loop(new, *step, *len);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // replace onset; no old file to close
+                            if let Some(onset) =
+                                kit.onset(None, *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
+                            {
+                                *self = Event::Loop(onset, step, *len);
+                            }
                         }
                     }
                 }
@@ -113,12 +138,12 @@ impl<IO: Read + Write + Seek> Event<IO> {
     }
 }
 
-pub struct Input<IO: Read + Write + Seek> {
-    pub active: Event<IO>,
+pub struct Input<F: FileHandler> {
+    pub active: Event<F>,
     pub buffer: Option<passive::Event>,
 }
 
-impl<IO: Read + Write + Seek> Input<IO> {
+impl<F: FileHandler> Input<F> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
@@ -128,7 +153,7 @@ impl<IO: Read + Write + Seek> Input<IO> {
     }
 }
 
-pub struct Phrase<IO: Read + Write + Seek> {
+pub struct Phrase<F: FileHandler> {
     /// next event index (sans drift)
     pub next: usize,
     /// remaining steps in event
@@ -136,10 +161,10 @@ pub struct Phrase<IO: Read + Write + Seek> {
     /// remaining steps in phrase
     pub phrase_rem: u16,
     /// active event (last consumed)
-    pub active: Event<IO>,
+    pub active: Event<F>,
 }
 
-pub struct Record<const STEPS: usize, IO: Read + Write + Seek> {
+pub struct Record<const STEPS: usize, F: FileHandler> {
     /// running bounded event queue
     events: Deque<passive::Stamped, STEPS>,
     /// baked events
@@ -147,10 +172,10 @@ pub struct Record<const STEPS: usize, IO: Read + Write + Seek> {
     /// trimmed source phrase, if any
     pub phrase: Option<passive::Phrase<STEPS>>,
     /// active phrase, if any
-    pub active: Option<Phrase<IO>>,
+    pub active: Option<Phrase<F>>,
 }
 
-impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
+impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
@@ -201,7 +226,7 @@ impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_phrase<const PADS: usize>(
+    pub fn generate_phrase<const PADS: usize>(
         &mut self,
         step: u16,
         bank: &pads::Bank<PADS, STEPS>,
@@ -209,35 +234,32 @@ impl<const STEPS: usize, IO: Read + Write + Seek> Record<STEPS, IO> {
         kit_drift: f32,
         phrase_drift: f32,
         rand: &mut impl Rand,
-        fs: &mut impl FileHandler<File = IO>,
-    ) -> Result<(), IO::Error> {
+        fs: &mut F,
+    ) -> Result<(), F::Error> {
         if let Some(phrase) = self.phrase.as_mut() {
-            if let Some(phrase) = phrase
-                .generate_active(
-                    &mut self.active,
-                    step,
-                    bank,
-                    kit_index,
-                    kit_drift,
-                    phrase_drift,
-                    rand,
-                    fs,
-                )
-                .await?
-            {
+            if let Some(phrase) = phrase.generate_active(
+                &mut self.active,
+                step,
+                bank,
+                kit_index,
+                kit_drift,
+                phrase_drift,
+                rand,
+                fs,
+            )? {
                 self.active = Some(phrase);
             }
         }
         Ok(())
     }
 
-    pub fn take(&mut self) -> Option<(passive::Phrase<STEPS>, Phrase<IO>)> {
+    pub fn take(&mut self) -> Option<(passive::Phrase<STEPS>, Phrase<F>)> {
         self.buffer.clear();
         Some((self.phrase.take()?, self.active.take()?))
     }
 }
 
-pub struct Pool<const PHRASES: usize, IO: Read + Write + Seek> {
+pub struct Pool<const PHRASES: usize, F: FileHandler> {
     /// next phrase index (sans drift)
     pub next: usize,
     /// base phrase sequence
@@ -245,10 +267,10 @@ pub struct Pool<const PHRASES: usize, IO: Read + Write + Seek> {
     /// pad index of source phrase, if any
     pub index: Option<u8>,
     /// active phrase, if any
-    pub active: Option<Phrase<IO>>,
+    pub active: Option<Phrase<F>>,
 }
 
-impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
+impl<const PHRASES: usize, F: FileHandler> Pool<PHRASES, F> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
@@ -260,16 +282,16 @@ impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_phrase<const PADS: usize, const STEPS: usize>(
-        &mut self,
+    pub fn generate_phrase<'d, const PADS: usize, const STEPS: usize>(
+        &'d mut self,
         step: u16,
-        bank: &pads::Bank<PADS, STEPS>,
+        bank: &'d pads::Bank<PADS, STEPS>,
         kit_index: usize,
         kit_drift: f32,
         phrase_drift: f32,
         rand: &mut impl Rand,
-        fs: &mut impl FileHandler<File = IO>,
-    ) -> Result<(), IO::Error> {
+        fs: &mut F,
+    ) -> Result<(), F::Error> {
         if self.phrases.is_empty() {
             self.next = 0;
             self.active = None;
@@ -284,19 +306,16 @@ impl<const PHRASES: usize, IO: Read + Write + Seek> Pool<PHRASES, IO> {
             };
             self.index = Some(index);
             if let Some(phrase) = &bank.phrases[index as usize] {
-                if let Some(phrase) = phrase
-                    .generate_active(
-                        &mut self.active,
-                        step,
-                        bank,
-                        kit_index,
-                        kit_drift,
-                        phrase_drift,
-                        rand,
-                        fs,
-                    )
-                    .await?
-                {
+                if let Some(phrase) = phrase.generate_active(
+                    &mut self.active,
+                    step,
+                    bank,
+                    kit_index,
+                    kit_drift,
+                    phrase_drift,
+                    rand,
+                    fs,
+                )? {
                     self.active = Some(phrase);
                 }
             }

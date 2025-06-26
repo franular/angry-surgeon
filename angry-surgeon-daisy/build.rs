@@ -9,12 +9,10 @@ fn main() {
         .unwrap()
         .write_all(include_bytes!("memory.x"))
         .unwrap();
-    File::create(out.join("my-link.x"))
-        .unwrap()
-        .write_all(include_bytes!("my-link.x"))
-        .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
+    println!("cargo:rustc-link-arg=--nmagic");
+    println!("cargo:rustc-link-arg=-Tlink.x");
+    println!("cargo:rustc-link-arg=--print-memory-usage");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=memory.x");
-    println!("cargo:rerun-if-changed=my-link.x");
 }

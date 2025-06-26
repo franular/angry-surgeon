@@ -1,192 +1,258 @@
-use crate::{audio, tui};
-use embassy_stm32::{
-    adc::{Adc, AdcChannel, AnyAdcChannel, Instance, SampleTime},
-    peripherals::{ADC1, DMA1_CH1},
-    Peri,
-};
-use embassy_sync::channel::{DynamicReceiver, DynamicSender};
-use grounded::uninit::GroundedArrayCell;
+use stm32h7xx_hal::adc::{Adc, Disabled, Enabled};
 
-#[link_section = ".sram1_bss"]
-static ADC_BUFFER: GroundedArrayCell<u16, 7> = GroundedArrayCell::uninit();
+pub const CHANNEL_COUNT: usize = 11;
 
-pub struct Pots<T: Instance> {
-    pub gain: AnyAdcChannel<T>,
-    pub speed: AnyAdcChannel<T>,
-    pub drift: AnyAdcChannel<T>,
+pub mod channels {
+    pub const TEMPO: u8 = 0;
+    pub const POTS_A: core::ops::RangeInclusive<u8> = 1..=3;
+    pub const THUMB_A: core::ops::RangeInclusive<u8> = 4..=5;
+    pub const POTS_B: core::ops::RangeInclusive<u8> = 6..=8;
+    pub const THUMB_B: core::ops::RangeInclusive<u8> = 9..=10;
 }
 
-impl<T: Instance> Pots<T> {
-    pub fn new(
-        gain: impl AdcChannel<T>,
-        speed: impl AdcChannel<T>,
-        drift: impl AdcChannel<T>,
-    ) -> Self {
-        Self {
-            gain: gain.degrade_adc(),
-            speed: speed.degrade_adc(),
-            drift: drift.degrade_adc(),
+#[derive(Default)]
+pub enum Preshift {
+    #[default]
+    None,
+    Primed,
+    FromLess,
+    FromMore,
+}
+
+#[derive(Default)]
+pub struct Last {
+    pub preshift: Preshift,
+    pub samples: [u16; 2],
+}
+
+#[derive(Default)]
+pub struct Pots {
+    pub shift: bool,
+    pub last: [Last; 3],
+}
+
+impl Pots {
+    pub fn shift(&mut self, shift: bool) {
+        self.shift = shift;
+        for l in self.last.iter_mut() {
+            l.preshift = Preshift::Primed;
         }
     }
-}
 
-pub struct Thumbstick<T: Instance> {
-    pub x: AnyAdcChannel<T>,
-    pub y: AnyAdcChannel<T>,
-    pub flip_x: bool,
-}
+    pub fn last(&self, index: u8) -> u16 {
+        self.last[index as usize].samples[self.shift as usize]
+    }
 
-impl<T: Instance> Thumbstick<T> {
-    pub fn new(x: impl AdcChannel<T>, y: impl AdcChannel<T>, flip_x: bool) -> Self {
-        Self {
-            x: x.degrade_adc(),
-            y: y.degrade_adc(),
-            flip_x,
+    /// sets value if returned from shift discontinuity; returns true if set
+    pub fn maybe_set(&mut self, index: usize, sample: u16) -> bool {
+        let preshift = &mut self.last[index].preshift;
+        let last = &mut self.last[index].samples[self.shift as usize];
+        match preshift {
+            Preshift::None => {
+                if sample == *last {
+                    false
+                } else {
+                    *last = sample;
+                    true
+                }
+            }
+            Preshift::Primed => {
+                if sample < *last {
+                    *preshift = Preshift::FromLess;
+                    false
+                } else if sample > *last {
+                    *preshift = Preshift::FromMore;
+                    false
+                } else {
+                    *preshift = Preshift::None;
+                    false
+                }
+            }
+            Preshift::FromLess => {
+                if sample >= *last {
+                    *preshift = Preshift::None;
+                    *last = sample;
+                    true
+                } else {
+                    false
+                }
+            }
+            Preshift::FromMore => {
+                if sample <= *last {
+                    *preshift = Preshift::None;
+                    *last = sample;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 }
 
 #[derive(Default)]
-struct LastBank {
-    gain: u16,
-    width: u16,
-    speed: u16,
-    roll: u16,
-    kit_drift: u16,
-    phrase_drift: u16,
-    x: u16,
-    y: u16,
+pub struct AdcData {
+    pub mult: f32,
+    pub tempo: u16,
+    pub pots: [Pots; 2],
+    pub thumbs: [[u16; 2]; 2],
 }
 
-#[embassy_executor::task]
-pub async fn adc(
-    mut adc: Adc<'static, ADC1>,
-    mut dma: Peri<'static, DMA1_CH1>,
-    mut tempo_pot: AnyAdcChannel<ADC1>,
-    mut pots_a: Pots<ADC1>,
-    mut thumbstick_a: Thumbstick<ADC1>,
-    mut pots_b: Pots<ADC1>,
-    mut thumbstick_b: Thumbstick<ADC1>,
-    clock_tx: DynamicSender<'static, f32>,
-    audio_tx: DynamicSender<'static, audio::Cmd<'static>>,
-    tui_tx: DynamicSender<'static, tui::Cmd>,
-    shift_rx: DynamicReceiver<'static, (audio::Bank, bool)>,
-) {
-    let adc_buffer: &mut [u16] = unsafe {
-        ADC_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = ADC_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
-    let mut last_tempo = 0u16;
-    let mut last_a = LastBank::default();
-    let mut shift_a = false;
-    let mut last_b = LastBank::default();
-    let mut shift_b = false;
-    loop {
-        if let Ok((bank, shift)) = shift_rx.try_receive() {
-            match bank {
-                audio::Bank::A => shift_a = shift,
-                audio::Bank::B => shift_b = shift,
-            }
-        }
-        adc.read(
-            dma.reborrow(),
-            [
-                &mut tempo_pot,
-                &mut pots_a.gain,
-                &mut pots_a.speed,
-                &mut pots_a.drift,
-                &mut thumbstick_a.x,
-                &mut thumbstick_a.y,
-                &mut pots_b.gain,
-                &mut pots_b.speed,
-                &mut pots_b.drift,
-                &mut thumbstick_b.x,
-                &mut thumbstick_b.y,
-            ]
-            .into_iter()
-            .map(|v| (v, SampleTime::CYCLES64_5)),
-            adc_buffer,
-        )
-        .await;
+/// read initial vref for conversion factor (only available via adc3)
+pub fn init_data(
+    adc: Adc<crate::hal::pac::ADC3, Disabled>,
+    common: &mut crate::hal::pac::ADC3_COMMON,
+) -> AdcData {
+    // enable vrefint
+    common.ccr.modify(|_, w| w.vrefen().enabled());
+    let mut adc = adc.enable();
+    let regs = adc.inner_mut();
 
-        for i in 0..adc_buffer.len() {
-            // quantize to 9 bits
-            let current = (adc_buffer[i] as f32 / u16::MAX as f32 * (1 << 9) as f32) as u16;
+    // 32x oversampling with rightshift for averaging
+    regs.cfgr2
+        .modify(|_, w| w.rovse().enabled().osvr().variant(31).ovss().variant(5));
+    // 12 bit, write to dr
+    regs.cfgr.modify(|_, w| {
+        w.res()
+            .twelve_bit_v()
+            .dmngt()
+            .dr()
+            .cont()
+            .single()
+            .discen()
+            .enabled()
+    });
+    // zero lshift
+    regs.cfgr2.modify(|_, w| w.lshift().variant(0));
+    // preselect vref channel (19)
+    regs.pcsel
+        .modify(|r, w| unsafe { w.pcsel().bits(r.pcsel().bits() | 1 << 19) });
+    // sample time
+    regs.smpr2.modify(|_, w| w.smp19().cycles387_5());
+    // build sequence
+    regs.sqr1.modify(|_, w| w.l().variant(0).sq1().variant(19));
+    // start conversion, wait
+    regs.cr.modify(|_, w| w.adstart().start_conversion());
+    while regs.isr.read().eoc().is_not_complete() {}
 
-            macro_rules! bank_pot {
-                ($bank:expr,$cmd:ident,$last:expr,$value:expr) => {
-                    if current != $last {
-                        audio_tx
-                            .send(super::audio_bank_cmd!($bank, $cmd, $value))
-                            .await;
-                        tui_tx.send(super::tui_bank_cmd!($bank, $cmd, $value)).await;
-                        $last = current;
-                    }
-                };
-            }
+    let vrefint_cal = regs.calfact.read().calfact_s().bits();
+    let vrefint_data = regs.dr.read().rdata().bits();
+    // normally this would be multiplied by 3.3V, but this mult is proportion
+    let mult = vrefint_cal as f32 / (vrefint_data as f32 * ((1 << 12) - 1) as f32);
+    // disable adc and vref channel
+    adc.disable();
+    common.ccr.modify(|_, w| w.vrefen().disabled());
 
-            let float = current as f32 / (1 << 9) as f32;
-            if i == 0 {
-                if current != last_tempo {
-                    let v = 30. + float * 270.;
-                    clock_tx.send(v).await;
-                    audio_tx.send(audio::Cmd::AssignTempo(v)).await;
-                    last_tempo = current;
-                }
-            } else {
-                let (bank, thumbstick, last, shift) = if (i - 1) / 5 == 0 {
-                    (audio::Bank::A, &thumbstick_a, &mut last_a, shift_a)
-                } else {
-                    (audio::Bank::B, &thumbstick_b, &mut last_b, shift_b)
-                };
-                match i {
-                    1 | 6 => {
-                        if shift {
-                            bank_pot!(bank, AssignWidth, last.width, float);
-                        } else {
-                            bank_pot!(bank, AssignGain, last.gain, float * 2.);
-                        }
-                    }
-                    2 | 7 => {
-                        if shift {
-                            bank_pot!(bank, AssignRoll, last.roll, float * 8.);
-                        } else {
-                            bank_pot!(bank, AssignSpeed, last.speed, float * 2.);
-                        }
-                    }
-                    3 | 8 => {
-                        if shift {
-                            bank_pot!(bank, AssignPhraseDrift, last.phrase_drift, float);
-                        } else {
-                            bank_pot!(bank, AssignKitDrift, last.kit_drift, float);
-                        }
-                    }
-                    4 | 9 => {
-                        if current != last.x {
-                            let v = if thumbstick.flip_x {
-                                float * -2.
-                            } else {
-                                float * 2.
-                            };
-                            audio_tx
-                                .send(super::audio_bank_cmd!(bank, OffsetSpeed, v))
-                                .await;
-                            last.x = current;
-                        }
-                    }
-                    5 | 10 => {
-                        if current != last.y {
-                            let v = float * 2.;
-                            audio_tx
-                                .send(super::audio_bank_cmd!(bank, OffsetRoll, v))
-                                .await;
-                            last.y = current;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
+    AdcData {
+        mult,
+        ..Default::default()
     }
+}
+
+/// start hardcoded adc seqeunce (friendship ENDED with genericism)
+pub fn start_seq(adc: &mut Adc<crate::hal::pac::ADC1, Enabled>) {
+    let regs = adc.inner_mut();
+
+    // 32x oversampling with rightshift for averaging
+    regs.cfgr2
+        .modify(|_, w| w.rovse().enabled().osvr().variant(31).ovss().variant(5));
+    // 12 bit, dma circular
+    regs.cfgr.modify(|_, w| {
+        w.res()
+            .twelve_bit_v()
+            // ideally, this would be dma_circular() and the associated transfer
+            // would be circular_buffer; unfortunately, this seems to cause dma
+            // conflicts with sdmmc or something with higher tempo and speed,
+            // causing adc and dma to desync such that the actually indicies of
+            // the adc data array are shifted. to avoid this, the transfer is
+            // one shot, and the adc restarted after every transfer in interrupt
+            .dmngt()
+            .dma_one_shot()
+            .cont()
+            .continuous()
+            .discen()
+            .disabled()
+    });
+    // zero lshift
+    regs.cfgr2.modify(|_, w| w.lshift().variant(0));
+    // preselect channels
+    regs.pcsel.modify(|r, w| unsafe {
+        w.pcsel().bits(
+            r.pcsel().bits()
+                | 1 << 10
+                | 1 << 15
+                | 1 << 5
+                | 1 << 7
+                | 1 << 3
+                | 1 << 11
+                | 1 << 4
+                | 1 << 19
+                | 1 << 18
+                | 1 << 17
+                | 1 << 16,
+        )
+    });
+    // sample times
+    regs.smpr1.modify(|_, w| {
+        w.smp0()
+            .cycles387_5()
+            .smp1()
+            .cycles387_5()
+            .smp2()
+            .cycles387_5()
+            .smp3()
+            .cycles387_5()
+            .smp4()
+            .cycles387_5()
+            .smp5()
+            .cycles387_5()
+            .smp6()
+            .cycles387_5()
+            .smp7()
+            .cycles387_5()
+            .smp8()
+            .cycles387_5()
+            .smp9()
+            .cycles387_5()
+    });
+    regs.smpr2.modify(|_, w| w.smp10().cycles387_5());
+    // build sequence
+    regs.sqr1.modify(
+        |_, w| {
+            w.l()
+                .variant(CHANNEL_COUNT as u8 - 1)
+                .sq1()
+                .variant(10) // A0  tempo
+                .sq2()
+                .variant(15) // A1  pots a:
+                .sq3()
+                .variant(5) // A2
+                .sq4()
+                .variant(7)
+        }, // A3
+    );
+    regs.sqr2.modify(
+        |_, w| {
+            w.sq5()
+                .variant(3) // A4  thumb a:
+                .sq6()
+                .variant(11) // A5
+                .sq7()
+                .variant(4) // A6  pots b:
+                .sq8()
+                .variant(19) // A7
+                .sq9()
+                .variant(18)
+        }, // A8
+    );
+    regs.sqr3.modify(
+        |_, w| {
+            w.sq10()
+                .variant(17) // A9  thumb b:
+                .sq11()
+                .variant(16)
+        }, // A10
+    );
+    // start conversion
+    regs.cr.modify(|_, w| w.adstart().start_conversion());
 }

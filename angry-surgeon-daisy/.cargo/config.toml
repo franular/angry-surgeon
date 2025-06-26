@@ -1,16 +1,5 @@
-[target.thumbv7em-none-eabihf]
-runner = 'probe-rs run --chip STM32H750IBKx'
-rustflags = [
-  "-C", "link-arg=--nmagic",
-  "-C", "link-arg=-Tmy-link.x",
-  "-C", "link-arg=--print-memory-usage",
-]
-
 [build]
 target = "thumbv7em-none-eabihf"
-
-[env]
-DEFMT_LOG = "trace"
 
 [unstable]
 build-std = ["core"]
