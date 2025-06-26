@@ -398,17 +398,19 @@ mod app {
         let mut beat_dur = MicrosDurationU32::micros((60_000_000. / tempo_rx.wait().await) as u32);
         let mut last_step = Mono::now();
 
-        let mut clock_out =
-            input::clock::Blink::new(clock_out, last_step);
-        let mut tempo_led =
-            input::clock::Blink::new(tempo_led, last_step);
+        let mut clock_out = input::clock::Blink::new(clock_out, last_step);
+        let mut tempo_led = input::clock::Blink::new(tempo_led, last_step);
 
         loop {
             match select4(
-                tempo_led.tick(beat_dur, MicrosDurationU32::micros(beat_dur.to_micros() / 2)),
-                clock_out.tick(MicrosDurationU32::micros(
-                    beat_dur.to_micros() / audio::PPQ as u32,
-                ), MicrosDurationU32::millis(15)),
+                tempo_led.tick(
+                    beat_dur,
+                    MicrosDurationU32::micros(beat_dur.to_micros() / 2),
+                ),
+                clock_out.tick(
+                    MicrosDurationU32::micros(beat_dur.to_micros() / audio::PPQ as u32),
+                    MicrosDurationU32::millis(15),
+                ),
                 Mono::delay_until(
                     last_step
                         + MicrosDurationU32::micros(beat_dur.to_micros() / audio::STEP_DIV as u32),
@@ -432,7 +434,7 @@ mod app {
         }
     }
 
-    #[task(binds = EXTI15_10, shared = [tempo_tx], local = [clock_in_signal, last_clock_in], priority = 2)]
+    #[task(binds = EXTI15_10, shared = [tempo_tx], local = [clock_in_signal, last_clock_in], priority = 3)]
     fn clock_in(mut cx: clock_in::Context) {
         cx.local.clock_in_signal.clear_interrupt_pending_bit();
         let now = Mono::now();
