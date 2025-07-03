@@ -18,12 +18,12 @@ pub struct Wav<F: FileHandler> {
 
 impl<F: FileHandler> Wav<F> {
     pub fn pos(&mut self, fs: &mut F) -> Result<u64, F::Error> {
-        Ok(fs.stream_position(&self.file)? - 44)
+        Ok(fs.stream_position(&mut self.file)? - 44)
     }
 
     pub fn seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
         fs.seek(
-            &self.file,
+            &mut self.file,
             embedded_io::SeekFrom::Start(44 + offset.rem_euclid(self.len as i64) as u64),
         )?;
         Ok(())

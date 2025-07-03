@@ -3,7 +3,7 @@ use embedded_io::{ErrorType, Seek, Write};
 use embedded_sdmmc::{BlockDevice, File, LfnBuffer, RawDirectory, RawFile, VolumeManager};
 
 pub const MAX_DIRS: usize = 3; // root always open, 2 more for file search
-pub const MAX_FILES: usize = 3; // one for bd, 2 for active wav
+pub const MAX_FILES: usize = 5; // one for bd, 2 * 2 for active wavs
 pub const MAX_VOLUMES: usize = 1;
 const READER_LEN: usize = 512;
 

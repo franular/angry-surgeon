@@ -58,7 +58,7 @@ dependencies = [
 name = "angry-surgeon-core"
 version = "0.1.0"
 dependencies = [
- "embedded-io-async",
+ "embedded-io",
  "heapless",
  "micromath",
  "serde",
@@ -74,9 +74,10 @@ dependencies = [
  "color-eyre",
  "cpal",
  "crossterm 0.29.0",
+ "embedded-io",
  "embedded-io-adapters",
- "embedded-io-async",
  "futures",
+ "heapless",
  "midir",
  "midly",
  "ratatui",

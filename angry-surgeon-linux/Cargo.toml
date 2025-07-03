@@ -9,9 +9,10 @@ angry-surgeon-core = { path = "../angry-surgeon-core", features = ["std"] }
 color-eyre = "0.6.3"
 cpal = { version = "0.15.3", features = ["jack"] }
 crossterm = "0.29.0"
+embedded-io = { version = "0.6.1", features = ["std"] }
 embedded-io-adapters = { version = "0.6.1", features = ["futures-03"] }
-embedded-io-async = { version = "0.6.1", features = ["std"] }
 futures = "0.3.31"
+heapless = "0.8.0"
 midir = "0.10.1"
 midly = "0.5.3"
 ratatui = "0.29.0"

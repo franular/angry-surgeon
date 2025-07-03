@@ -1,13 +1,16 @@
+#![allow(clippy::uninlined_format_args)]
+
 mod audio;
+mod fs;
 mod input;
 mod tui;
 
-use std::io::Write;
 use color_eyre::Result;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     FromSample, SizedSample,
 };
+use std::io::Write;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -37,7 +40,11 @@ fn main() -> Result<()> {
         }
     };
     let host = cpal::host_from_id(id)?;
-    let devices = host.output_devices().into_iter().flatten().collect::<Vec<_>>();
+    let devices = host
+        .output_devices()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let device = match devices.len() {
         0 => return Err(color_eyre::Report::msg("no audio device found")),
         1 => {
@@ -93,7 +100,7 @@ fn main() -> Result<()> {
             in_port,
             "angry-surgeon",
             move |_, message, input_handler: &mut input::InputHandler| {
-                input_handler.push(message).unwrap();
+                input_handler.push_midi(message).unwrap();
             },
             input_handler,
         )
@@ -104,7 +111,7 @@ fn main() -> Result<()> {
 
     let audio_handle = std::thread::spawn(move || -> Result<()> {
         let config = device.default_output_config().unwrap();
-        let handler = audio::AudioHandler::new(input_audio_rx);
+        let handler = audio::SystemHandler::new(input_audio_rx);
 
         match config.sample_format() {
             cpal::SampleFormat::I16 => play::<i16>(&device, &config.into(), handler)?,
@@ -128,14 +135,14 @@ fn main() -> Result<()> {
 fn play<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut handler: audio::AudioHandler,
+    mut handler: audio::SystemHandler,
 ) -> Result<()>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels as usize;
     let out_fn = move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-        futures::executor::block_on(handler.tick(data, channels)).unwrap();
+        handler.tick(data, channels).unwrap();
     };
     let err_fn = |_| {};
     let stream = device.build_output_stream(config, out_fn, err_fn, None)?;

@@ -51,7 +51,7 @@ impl<const LEN: usize> GrainReader<LEN> {
             // refill buffer backwards
             let mut slice = &mut self.buffer[..];
             while !slice.is_empty() {
-                let n = fs.read(&wav.file, slice)?;
+                let n = fs.read(&mut wav.file, slice)?;
                 if n == 0 {
                     wav.seek(0, fs)?;
                 }
@@ -77,7 +77,7 @@ impl<const LEN: usize> GrainReader<LEN> {
             // refill buffer forwards
             let mut slice = &mut self.buffer[..];
             while !slice.is_empty() {
-                let n = fs.read(&wav.file, slice)?;
+                let n = fs.read(&mut wav.file, slice)?;
                 if n == 0 {
                     wav.seek(0, fs)?;
                 }
