@@ -11,7 +11,7 @@ mod passive;
 pub use pads::{Bank, SystemHandler};
 pub use passive::{Event, Onset, Phrase, Rd, Wav};
 
-pub const GRAIN_LEN: usize = 256;
+pub const GRAIN_LEN: usize = 1024;
 
 pub trait FileHandler: ErrorType {
     type File;

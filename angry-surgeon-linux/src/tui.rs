@@ -1,18 +1,7 @@
-// use crate::audio::{Bank, BANK_COUNT, PAD_COUNT, MAX_PHRASE_LEN};
-// use color_eyre::eyre::Result;
-// use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind};
-// use ratatui::{
-//     buffer::Buffer,
-//     layout::{Constraint, Flex, Layout, Rect},
-//     style::Stylize,
-//     text::{Line, Text},
-//     widgets::{Block, Padding, Paragraph, Widget, Wrap},
-//     DefaultTerminal, Frame,
-// };
-
-use std::sync::mpsc::Receiver;
+use crate::audio::{MAX_PHRASE_COUNT, MAX_PHRASE_LEN, PAD_COUNT};
 
 use color_eyre::eyre::Result;
+use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
@@ -21,8 +10,7 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, Widget, Wrap},
     DefaultTerminal, Frame,
 };
-
-use crate::audio::{MAX_PHRASE_COUNT, MAX_PHRASE_LEN, PAD_COUNT};
+use std::sync::mpsc::{Receiver, Sender};
 
 pub const FILE_COUNT: usize = 5;
 const LOG_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -204,7 +192,7 @@ impl BankHandler {
             pads[*index as usize] = '@';
         }
         Paragraph::new(Text::raw(String::from_iter(pads)))
-            .block(Block::bordered().bold().padding(Padding::horizontal(5)))
+            .block(Block::bordered().bold().padding(Padding::horizontal(4)))
             .wrap(Wrap { trim: false })
             .render(area, buf);
     }
@@ -317,25 +305,29 @@ pub struct TuiHandler {
     bank_a: BankHandler,
     bank_b: BankHandler,
 
-    clock: bool,
+    deafen: bool,
     log: Option<(std::time::Instant, String)>,
+    clock: bool,
     state: GlobalState,
+
+    input_tx: Sender<crate::input::Cmd>,
 }
 
 impl TuiHandler {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(input_tx: Sender<crate::input::Cmd>) -> Self {
         Self {
             bank_a: BankHandler::new(),
             bank_b: BankHandler::new(),
 
-            clock: false,
+            deafen: false,
             log: None,
+            clock: false,
             state: GlobalState::Yield,
+
+            input_tx,
         }
     }
 
-    #[allow(unreachable_code)]
     pub fn run(&mut self, terminal: &mut DefaultTerminal, input_rx: Receiver<Cmd>) -> Result<()> {
         terminal.draw(|frame| self.draw(frame))?;
         loop {
@@ -346,6 +338,12 @@ impl TuiHandler {
                     flush = true;
                 }
             };
+            if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+                if self.kbd()? {
+                    break;
+                }
+                flush = true;
+            }
             match input_rx.try_recv() {
                 Ok(cmd) => {
                     self.cmd(cmd);
@@ -359,6 +357,29 @@ impl TuiHandler {
             }
         }
         Ok(())
+    }
+
+    /// returns true if should exit
+    fn kbd(&mut self) -> Result<bool> {
+        match event::read()? {
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                return Ok(true);
+            }
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                self.deafen = !self.deafen;
+                self.input_tx.send(crate::input::Cmd::Deafen(self.deafen))?;
+            }
+            _ => (),
+        }
+        Ok(false)
     }
 
     fn cmd(&mut self, cmd: Cmd) {
@@ -422,7 +443,7 @@ impl TuiHandler {
             .areas(area);
         let [a_area, b_area] = Layout::vertical(Constraint::from_maxes([3, 3]))
             .flex(Flex::SpaceBetween)
-            .areas(area);
+            .areas(pad_area);
         // render border
         Block::bordered().bold().render(pad_area, buf);
         // render bank a
@@ -492,7 +513,7 @@ impl TuiHandler {
             .areas(area);
         let [a_area, b_area] = Layout::vertical(Constraint::from_maxes([3, 3]))
             .flex(Flex::SpaceBetween)
-            .areas(area);
+            .areas(pad_area);
         // render border
         Block::bordered().bold().render(pad_area, buf);
         // render bank a
@@ -575,7 +596,7 @@ impl TuiHandler {
             .areas(area);
         let [a_area, b_area] = Layout::vertical(Constraint::from_maxes([3, 3]))
             .flex(Flex::SpaceBetween)
-            .areas(area);
+            .areas(pad_area);
         // render border
         Block::bordered().bold().render(pad_area, buf);
         // render bank a

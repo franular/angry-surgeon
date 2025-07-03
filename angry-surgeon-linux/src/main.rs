@@ -16,6 +16,7 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let (input_tui_tx, input_tui_rx) = std::sync::mpsc::channel::<tui::Cmd>();
+    let (tui_input_tx, tui_input_rx) = std::sync::mpsc::channel::<input::Cmd>();
     let (input_audio_tx, input_audio_rx) = std::sync::mpsc::channel::<audio::Cmd>();
 
     let hosts = cpal::available_hosts();
@@ -94,7 +95,7 @@ fn main() -> Result<()> {
                 .ok_or(color_eyre::Report::msg("invalid input port selected"))?
         }
     };
-    let input_handler = input::InputHandler::new(input_audio_tx, input_tui_tx);
+    let input_handler = input::InputHandler::new(input_audio_tx, input_tui_tx, tui_input_rx);
     let midi_in = midi_in
         .connect(
             in_port,
@@ -122,7 +123,7 @@ fn main() -> Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    tui::TuiHandler::new().run(&mut terminal, input_tui_rx)?;
+    tui::TuiHandler::new(tui_input_tx).run(&mut terminal, input_tui_rx)?;
 
     ratatui::restore();
     // pads thread completes once audio_tx held by input_handler dropped in midi_in thread

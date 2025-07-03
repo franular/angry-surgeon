@@ -1,5 +1,4 @@
 use angry_surgeon_core::{Event, Onset};
-
 use color_eyre::Result;
 use cpal::{FromSample, SizedSample};
 use std::{io::Write, sync::mpsc::Receiver};

@@ -139,8 +139,9 @@ impl<const STEPS: usize> Phrase<STEPS> {
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<u16>, F::Error> {
-        let drift =
-            rand.next_lim_usize(((phrase_drift * self.events.len() as f32).round()) as usize);
+        let drift = phrase_drift * self.events.len() as f32;
+        let drift = rand.next_lim_usize(drift as usize + 1)
+            + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;
         let index = (index + drift) % self.events.len();
         let stamped = &self.events[index];
         let event_rem = self

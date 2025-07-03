@@ -1,12 +1,12 @@
 use crate::{audio, tui};
-use angry_surgeon_core::{Event, Onset, Wav};
 use audio::{Bank, MAX_PHRASE_LEN, PAD_COUNT, PPQ, STEP_DIV};
 
+use angry_surgeon_core::{Event, Onset, Wav};
 use color_eyre::Result;
 use midly::{live::LiveEvent, MidiMessage};
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    sync::mpsc::{Receiver, Sender},
 };
 
 macro_rules! audio_bank_cmd {
@@ -48,8 +48,13 @@ macro_rules! inc {
 }
 
 macro_rules! paths {
-    ($iter:expr,$ext:expr) => {{
+    ($parent:expr,$iter:expr,$ext:expr) => {{
         let mut paths: Vec<Box<Path>> = Vec::new();
+        if let Some(parent) = $parent {
+            if !parent.to_str().unwrap().is_empty() {
+                paths.push(parent.to_path_buf().into_boxed_path())
+            }
+        }
         while let Some(Ok(entry)) = $iter.next() {
             let path = entry.path();
             if entry.metadata()?.is_dir()
@@ -63,18 +68,22 @@ macro_rules! paths {
 }
 
 macro_rules! to_fs {
-    ($names:expr,$index:expr) => {{
+    ($parent:expr,$names:expr,$index:expr) => {{
         let mut strings = [const { String::new() }; tui::FILE_COUNT];
         if !$names.is_empty() {
             for i in 0..tui::FILE_COUNT {
                 let index = ($index as isize + i as isize - tui::FILE_COUNT as isize / 2)
                     .rem_euclid($names.len() as isize) as usize;
-                strings[i] = $names[index]
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string();
+                if $parent == Some($names[index].as_ref()) {
+                    strings[i] = "..".to_string();
+                } else {
+                    strings[i] = $names[index]
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                }
             }
         }
         strings
@@ -110,6 +119,10 @@ mod ctrl {
     pub const DRIFT_B: u8 = 29;
 }
 
+pub enum Cmd {
+    Deafen(bool),
+}
+
 #[derive(PartialEq)]
 enum BankState {
     Mangle,
@@ -127,64 +140,68 @@ enum Preshift {
 
 struct Knob {
     /// base and shift
-    values: [u8; 2],
+    values: [Option<u8>; 2],
     preshift: Preshift,
 }
 
 impl Knob {
     fn new() -> Self {
         Self {
-            values: [0; 2],
+            values: [None; 2],
             preshift: Preshift::None,
         }
     }
 
     /// sets value if returned from shift discontinuity; return true if set
     fn maybe_set(&mut self, value: u8, shift: bool) -> bool {
-        let mine = &mut self.values[shift as usize];
-        match self.preshift {
-            Preshift::None => {
-                if value == *mine {
-                    false
-                } else {
-                    *mine = value;
-                    true
+        if let Some(mine) = self.values[shift as usize].as_mut() {
+            match self.preshift {
+                Preshift::None => {
+                    if value == *mine {
+                        false
+                    } else {
+                        *mine = value;
+                        true
+                    }
                 }
-            }
-            Preshift::Primed => {
-                if value < *mine {
-                    self.preshift = Preshift::FromLess;
-                } else if value > *mine {
-                    self.preshift = Preshift::FromMore;
-                } else {
-                    self.preshift = Preshift::None;
-                }
-                false
-            }
-            Preshift::FromLess => {
-                if value == *mine {
-                    self.preshift = Preshift::None;
-                    false
-                } else if value > *mine {
-                    self.preshift = Preshift::None;
-                    *mine = value;
-                    true
-                } else {
+                Preshift::Primed => {
+                    if value < *mine {
+                        self.preshift = Preshift::FromLess;
+                    } else if value > *mine {
+                        self.preshift = Preshift::FromMore;
+                    } else {
+                        self.preshift = Preshift::None;
+                    }
                     false
                 }
-            }
-            Preshift::FromMore => {
-                if value == *mine {
-                    self.preshift = Preshift::None;
-                    false
-                } else if value < *mine {
-                    self.preshift = Preshift::None;
-                    *mine = value;
-                    true
-                } else {
-                    false
+                Preshift::FromLess => {
+                    if value == *mine {
+                        self.preshift = Preshift::None;
+                        false
+                    } else if value > *mine {
+                        self.preshift = Preshift::None;
+                        *mine = value;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Preshift::FromMore => {
+                    if value == *mine {
+                        self.preshift = Preshift::None;
+                        false
+                    } else if value < *mine {
+                        self.preshift = Preshift::None;
+                        *mine = value;
+                        true
+                    } else {
+                        false
+                    }
                 }
             }
+        } else {
+            self.values[shift as usize] = Some(value);
+            true
         }
     }
 }
@@ -529,16 +546,18 @@ pub struct InputHandler {
     rd_cx: Option<Context>,
     banks_maybe_focus: Option<audio::Bank>,
 
+    deafen: bool,
     clock: u16,
     last_step: Option<std::time::Instant>,
     state: GlobalState,
 
     audio_tx: Sender<audio::Cmd>,
     tui_tx: Sender<tui::Cmd>,
+    cmd_rx: Receiver<Cmd>,
 }
 
 impl InputHandler {
-    pub fn new(audio_tx: Sender<audio::Cmd>, tui_tx: Sender<tui::Cmd>) -> Self {
+    pub fn new(audio_tx: Sender<audio::Cmd>, tui_tx: Sender<tui::Cmd>, cmd_rx: Receiver<Cmd>) -> Self {
         Self {
             bank_a: BankHandler::new(Bank::A),
             bank_b: BankHandler::new(Bank::B),
@@ -547,35 +566,46 @@ impl InputHandler {
             rd_cx: None,
             banks_maybe_focus: None,
 
+            deafen: false,
             clock: 0,
             last_step: None,
             state: GlobalState::Yield,
 
             audio_tx,
             tui_tx,
+            cmd_rx,
         }
     }
 
     pub fn push_midi(&mut self, message: &[u8]) -> Result<()> {
-        match LiveEvent::parse(message)? {
-            LiveEvent::Midi { message, .. } => {
-                match message {
-                    MidiMessage::NoteOff { key, .. } => self.note_off(key.as_int())?,
-                    MidiMessage::NoteOn { key, .. } => self.note_on(key.as_int())?,
-                    MidiMessage::Controller { controller, value } => {
-                        self.controller(controller.as_int(), value.as_int())?
-                    }
-                    MidiMessage::PitchBend { bend } => {
-                        // affect both banks
-                        self.audio_tx
-                            .send(audio::Cmd::OffsetSpeed(bend.as_f32() + 1.))?;
-                    }
-                    _ => (),
-                }
+        match self.cmd_rx.try_recv() {
+            Ok(cmd) => match cmd {
+                Cmd::Deafen(deafen) => self.deafen = deafen,
             }
-            LiveEvent::Realtime(midly::live::SystemRealtime::TimingClock) => self.timing_clock()?,
-            LiveEvent::Realtime(midly::live::SystemRealtime::Stop) => self.stop()?,
-            _ => (),
+            Err(std::sync::mpsc::TryRecvError::Empty) => (),
+            Err(e) => Err(e)?,
+        }
+        if !self.deafen {
+            match LiveEvent::parse(message)? {
+                LiveEvent::Midi { message, .. } => {
+                    match message {
+                        MidiMessage::NoteOff { key, .. } => self.note_off(key.as_int())?,
+                        MidiMessage::NoteOn { key, .. } => self.note_on(key.as_int())?,
+                        MidiMessage::Controller { controller, value } => {
+                            self.controller(controller.as_int(), value.as_int())?
+                        }
+                        MidiMessage::PitchBend { bend } => {
+                            // affect both banks
+                            self.audio_tx
+                                .send(audio::Cmd::OffsetSpeed(bend.as_f32() + 1.))?;
+                        }
+                        _ => (),
+                    }
+                }
+                LiveEvent::Realtime(midly::live::SystemRealtime::TimingClock) => self.timing_clock()?,
+                LiveEvent::Realtime(midly::live::SystemRealtime::Stop) => self.stop()?,
+                _ => (),
+            }
         }
         Ok(())
     }
@@ -635,8 +665,6 @@ impl InputHandler {
             _ if keys::BANK_A.contains(&key) => {
                 let index = key - keys::BANK_A.start;
                 self.bank_a.downs.retain(|&v| v != index);
-                self.tui_tx
-                    .send(tui_bank_cmd!(Bank::A, Pad, index, false))?;
                 match self.state {
                     GlobalState::Yield => {
                         self.bank_a.pad_up(&mut self.audio_tx, &mut self.tui_tx)?
@@ -650,12 +678,12 @@ impl InputHandler {
                         self.tui_tx.send(tui::Cmd::Yield)?;
                     }
                 }
+                self.tui_tx
+                    .send(tui_bank_cmd!(Bank::A, Pad, index, false))?;
             }
             _ if keys::BANK_B.contains(&key) => {
                 let index = key - keys::BANK_B.start;
                 self.bank_b.downs.retain(|&v| v != index);
-                self.tui_tx
-                    .send(tui_bank_cmd!(Bank::B, Pad, index, false))?;
                 match self.state {
                     GlobalState::Yield => {
                         self.bank_b.pad_up(&mut self.audio_tx, &mut self.tui_tx)?
@@ -669,6 +697,8 @@ impl InputHandler {
                         self.tui_tx.send(tui::Cmd::Yield)?;
                     }
                 }
+                self.tui_tx
+                    .send(tui_bank_cmd!(Bank::B, Pad, index, false))?;
             }
             _ => (),
         }
@@ -733,7 +763,6 @@ impl InputHandler {
             _ if keys::BANK_A.contains(&key) => {
                 let index = key - keys::BANK_A.start;
                 self.bank_a.downs.push(index);
-                self.tui_tx.send(tui_bank_cmd!(Bank::A, Pad, index, true))?;
                 if let GlobalState::LoadOnset { rd, onset_index } = &mut self.state {
                     let cx = self.rd_cx.as_ref().unwrap();
                     let path = &cx.paths[cx.file_index].with_extension("wav");
@@ -761,11 +790,11 @@ impl InputHandler {
                 } else {
                     self.bank_a.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
                 }
+                self.tui_tx.send(tui_bank_cmd!(Bank::A, Pad, index, true))?;
             }
             _ if keys::BANK_B.contains(&key) => {
                 let index = key - keys::BANK_B.start;
                 self.bank_b.downs.push(index);
-                self.tui_tx.send(tui_bank_cmd!(Bank::B, Pad, index, true))?;
                 if let GlobalState::LoadOnset { rd, onset_index } = &mut self.state {
                     let cx = self.rd_cx.as_ref().unwrap();
                     let path = &cx.paths[cx.file_index].with_extension("wav");
@@ -793,6 +822,7 @@ impl InputHandler {
                 } else {
                     self.bank_b.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
                 }
+                self.tui_tx.send(tui_bank_cmd!(Bank::B, Pad, index, true))?;
             }
             _ => (),
         }
@@ -857,15 +887,15 @@ impl InputHandler {
                     // trans load bd
                     if let Some(cx) = &mut self.bd_cx {
                         // recall dir
-                        let paths = paths!(std::fs::read_dir(&cx.dir)?, ".bd");
+                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(&cx.dir)?, "bd");
                         self.tui_tx
-                            .send(tui::Cmd::LoadBd(to_fs!(paths, cx.file_index)))?;
+                            .send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), paths, cx.file_index)))?;
                         cx.paths = paths;
                         self.state = GlobalState::LoadBd { bank };
                     } else if let Ok(mut dir) = std::fs::read_dir("banks") {
                         // open ./banks
-                        let paths = paths!(dir, ".bd");
-                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(paths, 0)))?;
+                        let paths = paths!(Some(Path::new("")), dir, "bd");
+                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(Some(Path::new("")), paths, 0)))?;
                         self.bd_cx = Some(Context {
                             dir: PathBuf::from("banks").into_boxed_path(),
                             file_index: 0,
@@ -880,15 +910,15 @@ impl InputHandler {
                     // trans load rd
                     if let Some(cx) = &mut self.rd_cx {
                         // recall dir
-                        let paths = paths!(std::fs::read_dir(&cx.dir)?, ".bd");
+                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(&cx.dir)?, "bd");
                         self.tui_tx
-                            .send(tui::Cmd::LoadRd(to_fs!(paths, cx.file_index)))?;
+                            .send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), paths, cx.file_index)))?;
                         cx.paths = paths;
                         self.state = GlobalState::LoadRd;
                     } else if let Ok(mut dir) = std::fs::read_dir("onsets") {
                         // open ./onsets
-                        let paths = paths!(dir, ".rd");
-                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(paths, 0)))?;
+                        let paths = paths!(Some(Path::new("")), dir, "rd");
+                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(Some(Path::new("")), paths, 0)))?;
                         self.rd_cx = Some(Context {
                             dir: PathBuf::from("onsets").into_boxed_path(),
                             file_index: 0,
@@ -907,15 +937,15 @@ impl InputHandler {
                 if let Ok(entry) = std::fs::metadata(path) {
                     if entry.is_dir() {
                         // open dir
-                        let paths = paths!(std::fs::read_dir(path)?, ".bd");
-                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(paths, 0)))?;
+                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(path)?, "bd");
+                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), paths, 0)))?;
                         self.bd_cx = Some(Context {
                             dir: path.clone(),
                             paths,
                             file_index: 0,
                         });
                     } else if entry.is_file()
-                        && path.extension().is_some_and(|v| v.to_str() == Some(".bd"))
+                        && path.extension().is_some_and(|v| v.to_str() == Some("bd"))
                     {
                         // load bd
                         let bytes = std::fs::read(path)?;
@@ -949,15 +979,15 @@ impl InputHandler {
                 if let Ok(entry) = std::fs::metadata(path) {
                     if entry.is_dir() {
                         // open dir
-                        let paths = paths!(std::fs::read_dir(path)?, ".rd");
-                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(paths, 0)))?;
+                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(path)?, "rd");
+                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), paths, 0)))?;
                         self.rd_cx = Some(Context {
                             dir: path.clone(),
                             paths,
                             file_index: 0,
                         });
                     } else if entry.is_file()
-                        && path.extension().is_some_and(|v| v.to_str() == Some(".rd"))
+                        && path.extension().is_some_and(|v| v.to_str() == Some("rd"))
                     {
                         // load rd
                         let bytes = std::fs::read(path)?;
@@ -980,7 +1010,7 @@ impl InputHandler {
             GlobalState::LoadOnset { .. } => {
                 let cx = self.rd_cx.as_ref().unwrap();
                 self.tui_tx
-                    .send(tui::Cmd::LoadRd(to_fs!(cx.paths, cx.file_index)))?;
+                    .send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), cx.paths, cx.file_index)))?;
                 self.state = GlobalState::LoadRd;
             }
         }
@@ -993,13 +1023,13 @@ impl InputHandler {
                 let cx = self.bd_cx.as_mut().unwrap();
                 dec!(&mut cx.file_index, cx.paths.len());
                 self.tui_tx
-                    .send(tui::Cmd::LoadBd(to_fs!(cx.paths, cx.file_index)))?;
+                    .send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), cx.paths, cx.file_index)))?;
             }
             GlobalState::LoadRd => {
                 let cx = self.rd_cx.as_mut().unwrap();
                 dec!(&mut cx.file_index, cx.paths.len());
                 self.tui_tx
-                    .send(tui::Cmd::LoadRd(to_fs!(cx.paths, cx.file_index)))?;
+                    .send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), cx.paths, cx.file_index)))?;
             }
             GlobalState::LoadOnset { rd, onset_index } => {
                 let cx = self.rd_cx.as_ref().unwrap();
@@ -1021,13 +1051,13 @@ impl InputHandler {
                 let cx = self.bd_cx.as_mut().unwrap();
                 inc!(&mut cx.file_index, cx.paths.len());
                 self.tui_tx
-                    .send(tui::Cmd::LoadBd(to_fs!(cx.paths, cx.file_index)))?;
+                    .send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), cx.paths, cx.file_index)))?;
             }
             GlobalState::LoadRd => {
                 let cx = self.rd_cx.as_mut().unwrap();
                 inc!(&mut cx.file_index, cx.paths.len());
                 self.tui_tx
-                    .send(tui::Cmd::LoadRd(to_fs!(cx.paths, cx.file_index)))?;
+                    .send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), cx.paths, cx.file_index)))?;
             }
             GlobalState::LoadOnset { rd, onset_index } => {
                 let cx = self.rd_cx.as_ref().unwrap();
