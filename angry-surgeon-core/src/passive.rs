@@ -17,6 +17,16 @@ pub struct Rd {
     pub onsets: alloc::vec::Vec<u64>,
 }
 
+impl Default for Rd {
+    fn default() -> Self {
+        Self {
+            tempo: None,
+            steps: None,
+            onsets: alloc::vec![0],
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Wav {
     pub tempo: Option<f32>,

@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, Widget, Wrap},
     DefaultTerminal, Frame,
 };
-use std::sync::mpsc::{Receiver, Sender};
+use std::{path::Path, sync::mpsc::{Receiver, Sender}};
 
 pub const FILE_COUNT: usize = 5;
 const LOG_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -301,7 +301,33 @@ impl BankHandler {
     }
 }
 
+struct Oneshots {
+    paths: Vec<Box<Path>>,
+    index: Option<usize>,
+}
+
+impl Oneshots {
+    fn new() -> Self {
+        Self { paths: Vec::new(), index: None }
+    }
+
+    fn open(&mut self, dir: impl AsRef<Path>) -> Result<()> {
+        self.index = None;
+        self.paths.clear();
+        for entry in std::fs::read_dir(dir)?.filter_map(|v| v.ok()) {
+            let path = entry.path();
+            if entry.metadata()?.is_file() && path.extension().is_some_and(|v| v.to_str() == Some("wav")) {
+                self.paths.push(path.into_boxed_path());
+            }
+        }
+        self.paths.sort();
+        Ok(())
+    }
+}
+
 pub struct TuiHandler {
+    oneshots: Oneshots,
+
     bank_a: BankHandler,
     bank_b: BankHandler,
 
@@ -310,12 +336,15 @@ pub struct TuiHandler {
     clock: bool,
     state: GlobalState,
 
+    audio_tx: Sender<crate::audio::Cmd>,
     input_tx: Sender<crate::input::Cmd>,
 }
 
 impl TuiHandler {
-    pub fn new(input_tx: Sender<crate::input::Cmd>) -> Self {
-        Self {
+    pub fn new(audio_tx: Sender<crate::audio::Cmd>, input_tx: Sender<crate::input::Cmd>) -> Result<Self> {
+        Ok(Self {
+            oneshots: Oneshots::new(),
+
             bank_a: BankHandler::new(),
             bank_b: BankHandler::new(),
 
@@ -324,8 +353,9 @@ impl TuiHandler {
             clock: false,
             state: GlobalState::Yield,
 
+            audio_tx,
             input_tx,
-        }
+        })
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal, input_rx: Receiver<Cmd>) -> Result<()> {
@@ -370,7 +400,61 @@ impl TuiHandler {
                 return Ok(true);
             }
             event::Event::Key(KeyEvent {
+                code: KeyCode::Char('1'),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                self.oneshots.open("oneshots/1")?;
+                self.log = Some((std::time::Instant::now(), "open ./oneshots/1".to_string()));
+            }
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Char('2'),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                self.oneshots.open("oneshots/2")?;
+                self.log = Some((std::time::Instant::now(), "open ./oneshots/2".to_string()));
+            }
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Char('3'),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                self.oneshots.open("oneshots/3")?;
+                self.log = Some((std::time::Instant::now(), "open ./oneshots/3".to_string()));
+            }
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Char('4'),
+                kind: KeyEventKind::Press,
+                ..
+            }) => {
+                self.oneshots.open("oneshots/4")?;
+                self.log = Some((std::time::Instant::now(), "open ./oneshots/4".to_string()));
+            }
+            event::Event::Key(KeyEvent {
                 code: KeyCode::Char(' '),
+                kind: KeyEventKind::Press,
+                ..
+            }) => if !self.oneshots.paths.is_empty() {
+                if let Some(i) = self.oneshots.index.as_mut() {
+                    if *i < self.oneshots.paths.len() - 1 {
+                        *i += 1;
+                    } else {
+                        self.oneshots.index = None;
+                    }
+                } else {
+                    self.oneshots.index = Some(0);
+                }
+                if let Some(index) = self.oneshots.index {
+                    self.audio_tx.send(crate::audio::Cmd::LoadOneshot(std::fs::File::open(self.oneshots.paths[index].clone())?))?;
+                    self.log = Some((std::time::Instant::now(), format!("oneshot {:>3}/{:>3}", index, self.oneshots.paths.len())));
+                } else {
+                    self.audio_tx.send(crate::audio::Cmd::StopOneshot)?;
+                    self.log = Some((std::time::Instant::now(), "oneshots exhausted".to_string()));
+                }
+            }
+            event::Event::Key(KeyEvent {
+                code: KeyCode::Enter,
                 kind: KeyEventKind::Press,
                 ..
             }) => {

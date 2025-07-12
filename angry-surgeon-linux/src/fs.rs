@@ -1,3 +1,4 @@
+use color_eyre::eyre::Result;
 use embedded_io::{Read, Seek};
 use embedded_io_adapters::std::FromStd;
 
@@ -35,3 +36,4 @@ impl angry_surgeon_core::FileHandler for LinuxFileHandler {
         file.seek(pos)
     }
 }
+

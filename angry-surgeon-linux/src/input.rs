@@ -55,14 +55,15 @@ macro_rules! paths {
                 paths.push(parent.to_path_buf().into_boxed_path())
             }
         }
-        while let Some(Ok(entry)) = $iter.next() {
+        for entry in $iter.filter_map(|v| v.ok()) {
             let path = entry.path();
             if entry.metadata()?.is_dir()
                 || path.extension().is_some_and(|v| v.to_str() == Some($ext))
             {
-                paths.push(path.into_boxed_path())
+                paths.push(path.into_boxed_path());
             }
         }
+        paths.sort();
         paths
     }};
 }
@@ -110,6 +111,8 @@ mod keys {
 }
 
 mod ctrl {
+    pub const GAIN_ONESHOT: u8 = 83;
+
     pub const GAIN_A: u8 = 102;
     pub const SPEED_A: u8 = 103;
     pub const DRIFT_A: u8 = 28;
@@ -165,9 +168,9 @@ impl Knob {
                     }
                 }
                 Preshift::Primed => {
-                    if value < *mine {
+                    if value < mine.saturating_sub(1) {
                         self.preshift = Preshift::FromLess;
-                    } else if value > *mine {
+                    } else if value > mine.saturating_add(1) {
                         self.preshift = Preshift::FromMore;
                     } else {
                         self.preshift = Preshift::None;
@@ -178,7 +181,7 @@ impl Knob {
                     if value == *mine {
                         self.preshift = Preshift::None;
                         false
-                    } else if value > *mine {
+                    } else if value >= mine.saturating_sub(1) {
                         self.preshift = Preshift::None;
                         *mine = value;
                         true
@@ -190,7 +193,7 @@ impl Knob {
                     if value == *mine {
                         self.preshift = Preshift::None;
                         false
-                    } else if value < *mine {
+                    } else if value <= mine.saturating_add(1) {
                         self.preshift = Preshift::None;
                         *mine = value;
                         true
@@ -251,7 +254,7 @@ impl BankHandler {
             let cmd = if self.shift {
                 audio_bank_cmd!(self.bank, AssignWidth, value as f32 / 127.)
             } else {
-                audio_bank_cmd!(self.bank, AssignGain, value as f32 / 127. * 2.)
+                audio_bank_cmd!(self.bank, AssignGain, value as f32 / 127.)
             };
             audio_tx.send(cmd)?;
         }
@@ -597,7 +600,7 @@ impl InputHandler {
                         MidiMessage::PitchBend { bend } => {
                             // affect both banks
                             self.audio_tx
-                                .send(audio::Cmd::OffsetSpeed(bend.as_f32() + 1.))?;
+                                .send(audio::Cmd::OffsetSpeed(1. - bend.as_f32()))?;
                         }
                         _ => (),
                     }
@@ -663,7 +666,7 @@ impl InputHandler {
                 }
             }
             _ if keys::BANK_A.contains(&key) => {
-                let index = key - keys::BANK_A.start;
+                let index = keys::BANK_A.start + PAD_COUNT as u8 - 1 - key; // flipped
                 self.bank_a.downs.retain(|&v| v != index);
                 match self.state {
                     GlobalState::Yield => {
@@ -675,6 +678,7 @@ impl InputHandler {
                     }
                     _ => {
                         self.state = GlobalState::Yield;
+                        self.audio_tx.send(audio_bank_cmd!(Bank::A, ForceEvent, Event::Sync))?;
                         self.tui_tx.send(tui::Cmd::Yield)?;
                     }
                 }
@@ -694,6 +698,7 @@ impl InputHandler {
                     }
                     _ => {
                         self.state = GlobalState::Yield;
+                        self.audio_tx.send(audio_bank_cmd!(Bank::B, ForceEvent, Event::Sync))?;
                         self.tui_tx.send(tui::Cmd::Yield)?;
                     }
                 }
@@ -761,66 +766,81 @@ impl InputHandler {
                 }
             }
             _ if keys::BANK_A.contains(&key) => {
-                let index = key - keys::BANK_A.start;
+                let index = keys::BANK_A.start + PAD_COUNT as u8 - 1 - key; // flipped
+                // let index = PAD_COUNT as u8 - (key - keys::BANK_A.start); // flipped
                 self.bank_a.downs.push(index);
-                if let GlobalState::LoadOnset { rd, onset_index } = &mut self.state {
-                    let cx = self.rd_cx.as_ref().unwrap();
-                    let path = &cx.paths[cx.file_index].with_extension("wav");
-                    if let Ok(meta) = std::fs::metadata(path) {
-                        // assign onset to pad
-                        let onset = Onset {
-                            wav: Wav {
-                                tempo: rd.tempo,
-                                steps: rd.steps,
-                                path: path.to_str().unwrap().to_string(),
-                                len: meta.len() - 44,
-                            },
-                            start: rd.onsets[*onset_index],
-                        };
-                        self.audio_tx.send(audio_bank_cmd!(
-                            Bank::A,
-                            AssignOnset,
-                            index,
-                            Box::new(onset)
-                        ))?;
-                    } else {
-                        self.tui_tx
-                            .send(tui::Cmd::Log("no wav found".to_string()))?;
+                match &mut self.state {
+                    GlobalState::Yield => self.bank_a.pad_down(&mut self.audio_tx, &mut self.tui_tx)?,
+                    GlobalState::LoadOnset { rd, onset_index } => {
+                        let cx = self.rd_cx.as_ref().unwrap();
+                        let path = &cx.paths[cx.file_index];
+                        if let Ok(meta) = std::fs::metadata(path) {
+                            // assign onset to pad
+                            let onset = Onset {
+                                wav: Wav {
+                                    tempo: rd.tempo,
+                                    steps: rd.steps,
+                                    path: path.to_str().unwrap().to_string(),
+                                    len: meta.len() - 44,
+                                },
+                                start: rd.onsets[*onset_index],
+                            };
+                            self.audio_tx.send(audio_bank_cmd!(
+                                Bank::A,
+                                AssignOnset,
+                                index,
+                                Box::new(onset)
+                            ))?;
+                            self.audio_tx.send(audio_bank_cmd!(Bank::A, ForceEvent, Event::Hold { index }))?;
+                        } else {
+                            self.tui_tx
+                                .send(tui::Cmd::Log("no wav found".to_string()))?;
+                        }
                     }
-                } else {
-                    self.bank_a.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
+                    _ => {
+                        self.state = GlobalState::Yield;
+                        self.bank_a.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
+                        self.tui_tx.send(tui::Cmd::Yield)?;
+                    }
                 }
                 self.tui_tx.send(tui_bank_cmd!(Bank::A, Pad, index, true))?;
             }
             _ if keys::BANK_B.contains(&key) => {
                 let index = key - keys::BANK_B.start;
                 self.bank_b.downs.push(index);
-                if let GlobalState::LoadOnset { rd, onset_index } = &mut self.state {
-                    let cx = self.rd_cx.as_ref().unwrap();
-                    let path = &cx.paths[cx.file_index].with_extension("wav");
-                    if let Ok(meta) = std::fs::metadata(path) {
-                        // assign onset to pad
-                        let onset = Onset {
-                            wav: Wav {
-                                tempo: rd.tempo,
-                                steps: rd.steps,
-                                path: path.to_str().unwrap().to_string(),
-                                len: meta.len() - 44,
-                            },
-                            start: rd.onsets[*onset_index],
-                        };
-                        self.audio_tx.send(audio_bank_cmd!(
-                            Bank::B,
-                            AssignOnset,
-                            index,
-                            Box::new(onset)
-                        ))?;
-                    } else {
-                        self.tui_tx
-                            .send(tui::Cmd::Log("no wav found".to_string()))?;
+                match &mut self.state {
+                    GlobalState::Yield => self.bank_b.pad_down(&mut self.audio_tx, &mut self.tui_tx)?,
+                    GlobalState::LoadOnset { rd, onset_index } => {
+                        let cx = self.rd_cx.as_ref().unwrap();
+                        let path = &cx.paths[cx.file_index].with_extension("wav");
+                        if let Ok(meta) = std::fs::metadata(path) {
+                            // assign onset to pad
+                            let onset = Onset {
+                                wav: Wav {
+                                    tempo: rd.tempo,
+                                    steps: rd.steps,
+                                    path: path.to_str().unwrap().to_string(),
+                                    len: meta.len() - 44,
+                                },
+                                start: rd.onsets[*onset_index],
+                            };
+                            self.audio_tx.send(audio_bank_cmd!(
+                                Bank::B,
+                                AssignOnset,
+                                index,
+                                Box::new(onset)
+                            ))?;
+                            self.audio_tx.send(audio_bank_cmd!(Bank::B, ForceEvent, Event::Hold { index }))?;
+                        } else {
+                            self.tui_tx
+                                .send(tui::Cmd::Log("no wav found".to_string()))?;
+                        }
                     }
-                } else {
-                    self.bank_b.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
+                    _ => {
+                        self.state = GlobalState::Yield;
+                        self.bank_b.pad_down(&mut self.audio_tx, &mut self.tui_tx)?;
+                        self.tui_tx.send(tui::Cmd::Yield)?;
+                    }
                 }
                 self.tui_tx.send(tui_bank_cmd!(Bank::B, Pad, index, true))?;
             }
@@ -831,6 +851,9 @@ impl InputHandler {
 
     fn controller(&mut self, controller: u8, value: u8) -> Result<()> {
         match controller {
+            ctrl::GAIN_ONESHOT => {
+                self.audio_tx.send(audio::Cmd::AssignGainOneshot(value as f32 / 127.))?;
+            }
             ctrl::GAIN_A => {
                 self.bank_a.gain(value, &mut self.audio_tx)?;
             }
@@ -876,6 +899,8 @@ impl InputHandler {
         self.clock = 0;
         self.last_step = None;
         self.audio_tx.send(audio::Cmd::Stop)?;
+        self.audio_tx.send(audio_bank_cmd!(Bank::A, ClearPool))?;
+        self.audio_tx.send(audio_bank_cmd!(Bank::B, ClearPool))?;
         self.tui_tx.send(tui::Cmd::Stop)?;
         Ok(())
     }
@@ -892,7 +917,7 @@ impl InputHandler {
                             .send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), paths, cx.file_index)))?;
                         cx.paths = paths;
                         self.state = GlobalState::LoadBd { bank };
-                    } else if let Ok(mut dir) = std::fs::read_dir("banks") {
+                    } else if let Ok(dir) = std::fs::read_dir("banks") {
                         // open ./banks
                         let paths = paths!(Some(Path::new("")), dir, "bd");
                         self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(Some(Path::new("")), paths, 0)))?;
@@ -910,14 +935,14 @@ impl InputHandler {
                     // trans load rd
                     if let Some(cx) = &mut self.rd_cx {
                         // recall dir
-                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(&cx.dir)?, "bd");
+                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(&cx.dir)?, "wav");
                         self.tui_tx
                             .send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), paths, cx.file_index)))?;
                         cx.paths = paths;
                         self.state = GlobalState::LoadRd;
-                    } else if let Ok(mut dir) = std::fs::read_dir("onsets") {
+                    } else if let Ok(dir) = std::fs::read_dir("onsets") {
                         // open ./onsets
-                        let paths = paths!(Some(Path::new("")), dir, "rd");
+                        let paths = paths!(Some(Path::new("")), dir, "wav");
                         self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(Some(Path::new("")), paths, 0)))?;
                         self.rd_cx = Some(Context {
                             dir: PathBuf::from("onsets").into_boxed_path(),
@@ -937,8 +962,8 @@ impl InputHandler {
                 if let Ok(entry) = std::fs::metadata(path) {
                     if entry.is_dir() {
                         // open dir
-                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(path)?, "bd");
-                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(cx.dir.parent(), paths, 0)))?;
+                        let paths = paths!(path.parent(), std::fs::read_dir(path)?, "bd");
+                        self.tui_tx.send(tui::Cmd::LoadBd(to_fs!(path.parent(), paths, 0)))?;
                         self.bd_cx = Some(Context {
                             dir: path.clone(),
                             paths,
@@ -979,28 +1004,37 @@ impl InputHandler {
                 if let Ok(entry) = std::fs::metadata(path) {
                     if entry.is_dir() {
                         // open dir
-                        let paths = paths!(cx.dir.parent(), std::fs::read_dir(path)?, "rd");
-                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(cx.dir.parent(), paths, 0)))?;
+                        let paths = paths!(path.parent(), std::fs::read_dir(path)?, "wav");
+                        self.tui_tx.send(tui::Cmd::LoadRd(to_fs!(path.parent(), paths, 0)))?;
                         self.rd_cx = Some(Context {
                             dir: path.clone(),
                             paths,
                             file_index: 0,
                         });
                     } else if entry.is_file()
-                        && path.extension().is_some_and(|v| v.to_str() == Some("rd"))
+                        && path.extension().is_some_and(|v| v.to_str() == Some("wav"))
                     {
-                        // load rd
-                        let bytes = std::fs::read(path)?;
-                        if let Ok(rd) = serde_json::from_slice::<angry_surgeon_core::Rd>(&bytes) {
+                        // load rd or default (loop file)
+                        if let Ok(bytes) = std::fs::read(path.with_extension("rd")) {
+                            if let Ok(rd) = serde_json::from_slice::<angry_surgeon_core::Rd>(&bytes) {
+                                self.tui_tx.send(tui::Cmd::LoadOnset {
+                                    name: to_fs!(path),
+                                    index: 0,
+                                    count: rd.onsets.len(),
+                                })?;
+                                self.state = GlobalState::LoadOnset { rd, onset_index: 0 };
+                            } else {
+                                self.tui_tx.send(tui::Cmd::Log("bad .rd".to_string()))?;
+                            }
+                        } else {
+                            let rd = angry_surgeon_core::Rd::default();
                             self.tui_tx.send(tui::Cmd::LoadOnset {
                                 name: to_fs!(path),
                                 index: 0,
                                 count: rd.onsets.len(),
                             })?;
                             self.state = GlobalState::LoadOnset { rd, onset_index: 0 };
-                        } else {
-                            self.tui_tx.send(tui::Cmd::Log("bad .rd".to_string()))?;
-                        }
+                        };
                     }
                 } else {
                     self.tui_tx
