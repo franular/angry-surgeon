@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bytemuck = "1.23.1"
 embedded-io = "0.6.1"
 # embedded-io-async = "0.6.1"
 heapless = { version = "0.8.0", features = ["serde"] }

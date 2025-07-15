@@ -509,7 +509,7 @@ impl TuiHandler {
     }
 
     fn render_clock(&self, area: Rect, buf: &mut Buffer) {
-        let [left, right] = Layout::horizontal(Constraint::from_maxes([11, 11]))
+        let [left, right] = Layout::horizontal(Constraint::from_maxes([14, 14]))
             .flex(Flex::Center)
             .areas(area);
         if self.clock {

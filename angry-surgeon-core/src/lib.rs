@@ -1,4 +1,4 @@
-#![no_std]
+// #![no_std]
 
 #[cfg(feature = "std")]
 extern crate alloc;
@@ -11,7 +11,7 @@ mod passive;
 pub use pads::{Bank, SystemHandler};
 pub use passive::{Event, Onset, Phrase, Rd, Wav};
 
-pub const GRAIN_LEN: usize = 512;
+pub const GRAIN_LEN: usize = 2048;
 
 pub trait FileHandler: ErrorType {
     type File;

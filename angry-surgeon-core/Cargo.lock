@@ -6,6 +6,7 @@ version = 4
 name = "angry-surgeon-core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "embedded-io",
  "heapless",
  "micromath",
@@ -19,6 +20,12 @@ name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
+
+[[package]]
+name = "bytemuck"
+version = "1.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c76a5792e44e4abe34d3abf15636779261d45a7450612059293d1d2cfc63422"
 
 [[package]]
 name = "byteorder"

@@ -22,77 +22,46 @@ impl<T: Copy + core::ops::Mul> Mod<T> {
     }
 }
 
-struct GrainReader<const LEN: usize> {
-    /// byte buffer
-    buffer: [u8; LEN],
+struct GrainReader<const MAX_LEN: usize> {
+    /// sample buffer
+    samples: [i16; MAX_LEN],
     /// i16 sample index
     index: f32,
+    bounds: core::ops::Range<usize>,
 }
 
-impl<const LEN: usize> GrainReader<LEN> {
+impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
     fn new() -> Self {
         Self {
-            buffer: [0; LEN],
+            samples: [0; MAX_LEN],
             index: 0.,
+            bounds: 0..0,
         }
     }
 
-    fn fill_backwards<F: FileHandler>(
-        &mut self,
-        stretch: f32,
-        wav: &mut active::Wav<F>,
-        fs: &mut F,
-    ) -> Result<(), F::Error> {
-        // grain len in samples
-        let grain_len = self.buffer.len() / 2 - 1;
-        while self.index < 0. {
-            // seek back two grains (in bytes)
-            let pos = wav.pos(fs)?;
-            wav.seek(pos as i64 - 4 * grain_len as i64, fs)?;
-            // refill buffer backwards
-            let mut slice = &mut self.buffer[..];
-            while !slice.is_empty() {
-                let n = fs.read(&mut wav.file, slice)?;
-                if n == 0 {
-                    wav.seek(0, fs)?;
-                }
-                slice = &mut slice[n..];
-            }
-            // seek back stretch and back -2 from extra interpolation word
-            let pos = wav.pos(fs)?;
-            // wav.seek(pos as i64 - 2 - (((stretch - 1.) * (grain_len * 2) as f32) as i64 & !1), fs)?;
-            wav.seek(pos as i64 - 2, fs)?;
-
-            self.index += grain_len as f32;
-        }
-        Ok(())
+    fn is_zero_xing(sample_a: i16, sample_b: i16) -> bool {
+        sample_a.signum() != sample_b.signum()
     }
 
-    fn fill_forwards<F: FileHandler>(
+    // refill buffer
+    fn fill<F: FileHandler>(
         &mut self,
-        stretch: f32,
         wav: &mut active::Wav<F>,
         fs: &mut F,
     ) -> Result<(), F::Error> {
-        // grain len in samples
-        let grain_len = self.buffer.len() / 2 - 1;
-        while self.index as usize >= grain_len {
-            // refill buffer forwards
-            let mut slice = &mut self.buffer[..];
-            while !slice.is_empty() {
-                let n = fs.read(&mut wav.file, slice)?;
-                if n == 0 {
-                    wav.seek(0, fs)?;
-                }
-                slice = &mut slice[n..];
+        let bytes = bytemuck::cast_slice_mut(&mut self.samples[..]);
+        let mut slice = bytes;
+        while !slice.is_empty() {
+            let n = fs.read(&mut wav.file, slice)?;
+            if n == 0 {
+                wav.seek(0, fs)?;
             }
-            // seek forward stretch and back -2 from extra interpolation word
-            let pos = wav.pos(fs)?;
-            // wav.seek(pos as i64 - 2 + (((stretch - 1.) * (grain_len * 2) as f32) as i64 & !1), fs)?;
-            wav.seek(pos as i64 - 2, fs)?;
-
-            self.index -= grain_len as f32;
+            slice = &mut slice[n..];
         }
+        // find zero xings about new grain
+        let start = self.samples.windows(2).enumerate().find(|(_, w)| Self::is_zero_xing(w[0], w[1])).map(|(i, _)| i).unwrap_or(0);
+        let end = self.samples.windows(2).enumerate().rev().find(|(_, w)| Self::is_zero_xing(w[0], w[1])).map(|(i, _)| i).unwrap_or(MAX_LEN - 1);
+        self.bounds = start..end;
         Ok(())
     }
 
@@ -100,23 +69,33 @@ impl<const LEN: usize> GrainReader<LEN> {
         &mut self,
         stretch: f32,
         pitch: f32,
+        reverse: bool,
         wav: &mut active::Wav<F>,
         fs: &mut F,
     ) -> Result<f32, F::Error> {
-        // update buffer if necessary
-        self.fill_backwards(stretch, wav, fs)?;
-        self.fill_forwards(stretch, wav, fs)?;
+        let init_pos = wav.pos(fs)?;
+        let init_bounds = self.bounds.clone();
 
+        if self.bounds.is_empty() || self.index >= self.bounds.end as f32 {
+            self.fill(wav, fs)?;
+            wav.seek(init_pos as i64 + (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
+            self.index = self.index - init_bounds.end as f32 + self.bounds.start as f32;
+        } else if self.index < self.bounds.start as f32 {
+            self.fill(wav, fs)?;
+            wav.seek(init_pos as i64 - (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
+            self.index = self.index - init_bounds.start as f32 + self.bounds.end as f32;
+        }
         // read sample with linear interpolation
-        let mut i16_buffer = [0u8; 2];
-        i16_buffer.copy_from_slice(&self.buffer[self.index as usize * 2..][0..2]);
-        let word_a =
-            i16::from_le_bytes(i16_buffer) as f32 / i16::MAX as f32 * (1. - self.index.fract());
-        i16_buffer.copy_from_slice(&self.buffer[self.index as usize * 2..][2..4]);
-        let word_b = i16::from_le_bytes(i16_buffer) as f32 / i16::MAX as f32 * self.index.fract();
-        let interpolated = word_a + word_b;
-        self.index += pitch;
-        Ok(interpolated)
+        let word_a = self.samples[self.index as usize] as f32 / i16::MAX as f32 * (1. - self.index.fract());
+        let word_b = self.samples[self.index as usize + 1] as f32 / i16::MAX as f32 * self.index.fract();
+
+        if reverse {
+            self.index -= pitch;
+        } else {
+            self.index += pitch;
+        }
+
+        Ok(word_a + word_b)
     }
 }
 
@@ -262,7 +241,7 @@ pub struct BankHandler<const PADS: usize, const STEPS: usize, const PHRASES: usi
     input: active::Input<F>,
     record: active::Record<STEPS, F>,
     pool: active::Pool<PHRASES, F>,
-    reader: GrainReader<{ crate::GRAIN_LEN + 2 }>,
+    reader: GrainReader<{ crate::GRAIN_LEN }>,
 }
 
 impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler>
@@ -318,23 +297,23 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         } else {
             &mut active::Event::Sync
         };
-        if self.tempo > 0. {
-            if let active::Event::Hold(onset, ..) = active {
-                return Self::read_grain::<T>(
-                    self.tempo,
-                    self.step_div,
-                    self.gain,
-                    self.speed.net(),
-                    self.width,
-                    self.reverse.is_some(),
-                    onset,
-                    &mut self.reader,
-                    fs,
-                    buffer,
-                    channels,
-                );
-            } else if let active::Event::Loop(onset, _, num) = active {
-                let wav = &mut onset.wav;
+        if let active::Event::Hold(onset, ..) = active {
+            return Self::read_grain::<T>(
+                self.tempo,
+                self.step_div,
+                self.gain,
+                self.speed.net(),
+                self.width,
+                self.reverse.is_some(),
+                onset,
+                &mut self.reader,
+                fs,
+                buffer,
+                channels,
+            );
+        } else if let active::Event::Loop(onset, _, num) = active {
+            let wav = &mut onset.wav;
+            if self.tempo > 0. {
                 let pos = wav.pos(fs)?;
                 let len = if let Some(steps) = wav.steps {
                     (*num as f32 / self.loop_div.net() * wav.len as f32 / steps as f32) as u64 & !1
@@ -351,20 +330,20 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                         wav.seek(onset.start as i64 * 2, fs)?;
                     }
                 }
-                return Self::read_grain::<T>(
-                    self.tempo,
-                    self.step_div,
-                    self.gain,
-                    self.speed.net(),
-                    self.width,
-                    self.reverse.is_some(),
-                    onset,
-                    &mut self.reader,
-                    fs,
-                    buffer,
-                    channels,
-                );
             }
+            return Self::read_grain::<T>(
+                self.tempo,
+                self.step_div,
+                self.gain,
+                self.speed.net(),
+                self.width,
+                self.reverse.is_some(),
+                onset,
+                &mut self.reader,
+                fs,
+                buffer,
+                channels,
+            );
         }
         Ok(())
     }
@@ -378,29 +357,16 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         width: f32,
         reverse: bool,
         onset: &mut active::Onset<F>,
-        reader: &mut GrainReader<{ crate::GRAIN_LEN + 2 }>,
+        reader: &mut GrainReader<{ crate::GRAIN_LEN }>,
         fs: &mut F,
         buffer: &mut [T],
         channels: usize,
     ) -> Result<(), F::Error> {
-        let stretch = onset.wav.tempo.map(|v| tempo * step_div as f32 / v).unwrap_or(1.);
-        let speed = if reverse {
-            speed * -1.
-        } else {
-            speed
-        };
-        // let mut speed = if let Some(t) = onset.wav.tempo {
-        //     tempo * step_div as f32 / t * speed
-        // } else {
-        //     speed
-        // };
-        // if reverse {
-        //     speed *= -1.;
-        // }
+        let stretch = onset.wav.tempo.map(|v| tempo * step_div as f32 / v / speed).unwrap_or(1.);
         // FIXME: support alternative channel counts?
         assert!(channels == 2);
         for i in 0..buffer.len() / channels {
-            let sample = reader.read_interpolated(stretch, speed, &mut onset.wav, fs)?;
+            let sample = reader.read_interpolated(stretch, speed, reverse, &mut onset.wav, fs)?;
             let l = sample * (1. + width * ((onset.pan - 0.5).abs() - 1.)) * gain;
             let r = sample * (1. + width * ((onset.pan + 0.5).abs() - 1.)) * gain;
             buffer[i * channels] += T::from(l);
