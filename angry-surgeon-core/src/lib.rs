@@ -1,8 +1,8 @@
 // #![no_std]
+#![allow(clippy::uninlined_format_args)]
 
-#[cfg(feature = "std")]
-extern crate alloc;
-use embedded_io::{ErrorType, SeekFrom};
+use core::fmt::{Debug, Display};
+use embedded_io::{ErrorType, ReadExactError, SeekFrom};
 
 mod active;
 mod pads;
@@ -11,7 +11,32 @@ mod passive;
 pub use pads::{Bank, SystemHandler};
 pub use passive::{Event, Onset, Phrase, Rd, Wav};
 
-pub const GRAIN_LEN: usize = 2048;
+pub const GRAIN_LEN: usize = 512;
+
+#[derive(Debug)]
+pub enum OpenError<E: Debug> {
+    BadFormat,
+    DataNotFound,
+    Other(E),
+}
+
+impl<E: Debug + Display> core::fmt::Display for OpenError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadFormat => write!(f, "bad format"),
+            Self::DataNotFound => write!(f, "data not found"),
+            Self::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl<E: Debug + Display> core::error::Error for OpenError<E> {}
+
+impl<E: Debug> From<E> for OpenError<E> {
+    fn from(value: E) -> Self {
+        Self::Other(value)
+    }
+}
 
 pub trait FileHandler: ErrorType {
     type File;
@@ -44,6 +69,18 @@ pub trait FileHandler: ErrorType {
 
     /// Seek to an offset, in bytes, in a stream.
     fn seek(&mut self, file: &mut Self::File, pos: SeekFrom) -> Result<u64, Self::Error>;
+
+    fn read_exact(&mut self, file: &mut Self::File, buf: &mut [u8]) -> Result<(), ReadExactError<Self::Error>> {
+        let mut slice = &mut buf[..];
+        while !slice.is_empty() {
+            let n = self.read(file, slice)?;
+            if n == 0 {
+                return Err(ReadExactError::UnexpectedEof);
+            }
+            slice = &mut slice[n..];
+        }
+        Ok(())
+    }
 
     /// Returns the current seek position from the start of the stream.
     fn stream_position(&mut self, file: &mut Self::File) -> Result<u64, Self::Error> {

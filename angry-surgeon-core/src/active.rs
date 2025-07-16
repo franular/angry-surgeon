@@ -1,6 +1,6 @@
 //! stateful data types
 
-use crate::{pads, passive, FileHandler};
+use crate::{pads, passive, FileHandler, OpenError};
 use core::mem::MaybeUninit;
 use heapless::{Deque, Vec};
 use tinyrand::Rand;
@@ -13,19 +13,48 @@ pub struct Wav<F: FileHandler> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
     pub file: F::File,
-    pub len: u64,
+    pub pcm_start: u64,
+    pub pcm_len: u64,
+    pub seek_to: Option<i64>,
 }
 
 impl<F: FileHandler> Wav<F> {
     pub fn pos(&mut self, fs: &mut F) -> Result<u64, F::Error> {
-        Ok(fs.stream_position(&mut self.file)? - 44)
+        Ok(fs.stream_position(&mut self.file)? - self.pcm_start)
     }
 
-    pub fn seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
-        fs.seek(
+    pub fn force_seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
+        println!("//r:{}", fs.seek(
             &mut self.file,
-            embedded_io::SeekFrom::Start(44 + offset.rem_euclid(self.len as i64) as u64),
-        )?;
+            embedded_io::SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
+        )?);
+        Ok(())
+    }
+
+    pub fn push_seek(&mut self, offset: i64) {
+        self.seek_to = Some(offset);
+    }
+
+    pub fn flush_seek(&mut self, fs: &mut F) -> Result<(), F::Error> {
+        if let Some(offset) = self.seek_to.take() {
+            println!("//l:{}", fs.seek(
+                &mut self.file,
+                embedded_io::SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn read(&mut self, bytes: &mut [u8], fs: &mut F) -> Result<(), F::Error> {
+        let mut slice = bytes;
+        while !slice.is_empty() {
+            let len = slice.len().min((self.pcm_len - self.pos(fs)?) as usize);
+            let n = fs.read(&mut self.file, &mut slice[..len])?;
+            if n == 0 {
+                self.force_seek(0, fs)?;
+            }
+            slice = &mut slice[n..];
+        }
         Ok(())
     }
 }
@@ -55,7 +84,7 @@ impl<F: FileHandler> Event<F> {
         kit_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         match input {
             passive::Event::Sync => {
                 if let Event::Hold(onset, ..) | Event::Loop(onset, ..) = self {
@@ -235,7 +264,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
         phrase_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         if let Some(phrase) = self.phrase.as_mut() {
             if let Some(phrase) = phrase.generate_active(
                 &mut self.active,
@@ -291,7 +320,7 @@ impl<const PHRASES: usize, F: FileHandler> Pool<PHRASES, F> {
         phrase_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         if self.phrases.is_empty() {
             self.next = 0;
             self.active = None;

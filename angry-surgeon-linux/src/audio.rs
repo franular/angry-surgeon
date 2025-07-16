@@ -55,12 +55,10 @@ pub enum BankCmd {
 
 pub struct Oneshot<const LEN: usize> {
     file: Option<std::fs::File>,
-    /// byte buffer
-    buffer: [u8; LEN],
-    /// i16 sample index
+    /// sample buffer
+    bytes: [u8; LEN],
     index: usize,
-    /// samples to read
-    rem: usize,
+    rem: u64,
     gain: f32,
 }
 
@@ -68,7 +66,7 @@ impl<const LEN: usize> Oneshot<LEN> {
     fn new() -> Self {
         Self {
             file: None,
-            buffer: [0; LEN],
+            bytes: [0; LEN],
             index: 0,
             rem: 0,
             gain: 1.,
@@ -77,30 +75,51 @@ impl<const LEN: usize> Oneshot<LEN> {
 
     fn load(&mut self, mut file: Option<std::fs::File>) -> Result<()> {
         if let Some(file) = file.as_mut() {
-            file.seek(std::io::SeekFrom::Start(44))?;
+            // parse wav looking for `data` subchunk
+            self.rem = loop {
+                let mut id = [0u8; 4];
+                file.read_exact(&mut id)?;
+                if &id[..] == b"RIFF" {
+                    file.seek_relative(4)?;
+                    let mut data = [0u8; 4];
+                    file.read_exact(&mut data)?;
+                    if &data[..] != b"WAVE" {
+                        return Err(color_eyre::Report::msg("bad format"));
+                    }
+                } else if &id[..] == b"data" {
+                    let mut size = [0u8; 4];
+                    file.read_exact(&mut size)?;
+                    let pcm_start = file.stream_position()?;
+                    let pcm_len = u32::from_le_bytes(size) as u64;
+                    break pcm_start + pcm_len;
+                } else {
+                    let mut size = [0u8; 4];
+                    file.read_exact(&mut size)?;
+                    let chunk_len = u32::from_le_bytes(size) as i64;
+                    file.seek_relative(chunk_len)?;
+                }
+            };
         }
         self.file = file;
-        self.index = 0;
-        self.rem = 0;
         Ok(())
     }
 
-    fn fill(
-        &mut self,
-    ) -> Result<(), std::io::Error> {
+    fn fill(&mut self) -> Result<(), std::io::Error> {
         if let Some(file) = self.file.as_mut() {
-            if self.rem == 0 {
+            if (self.index + 1) * 2 >= LEN || self.rem == 0 {
                 // refill buffer
-                self.index %= self.buffer.len() / 2;
-                let mut slice = &mut self.buffer[..];
+                self.index %= LEN / 2 - 1;
+                self.rem = self.rem.saturating_sub(LEN as u64);
+                let mut slice = &mut self.bytes[..];
                 while !slice.is_empty() {
-                    let n = file.read(slice)?;
+                    let len = slice.len().min(self.rem as usize);
+                    let n = file.read(&mut slice[..len])?;
                     if n == 0 {
                         self.file = None;
                         return Ok(());
                     }
                     slice = &mut slice[n..];
-                    self.rem += n;
+                    self.rem += n as u64;
                 }
             }
         }
@@ -121,7 +140,7 @@ impl<const LEN: usize> Oneshot<LEN> {
                 return Ok(());
             }
             let mut i16_buffer = [0u8; 2];
-            i16_buffer.copy_from_slice(&self.buffer[self.index * 2..][0..2]);
+            i16_buffer.copy_from_slice(&self.bytes[self.index * 2..][0..2]);
             let word = i16::from_le_bytes(i16_buffer) as f32 / i16::MAX as f32 * self.gain;
             self.index += 1;
             self.rem -= 2;
@@ -142,7 +161,7 @@ pub struct SystemHandler {
         crate::fs::LinuxFileHandler,
         tinyrand::Wyrand,
     >,
-    oneshot: Oneshot<{ angry_surgeon_core::GRAIN_LEN }>,
+    oneshot: Oneshot<{ angry_surgeon_core::GRAIN_LEN * 2 }>,
     cmd_rx: Receiver<Cmd>,
 }
 

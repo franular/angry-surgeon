@@ -1,6 +1,7 @@
 //! main logic-to-audio driver
 
-use crate::{active, passive, FileHandler};
+use crate::{active, passive, FileHandler, OpenError};
+use embedded_io::ReadExactError;
 use tinyrand::Rand;
 
 #[cfg(not(feature = "std"))]
@@ -43,26 +44,23 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
         sample_a.signum() != sample_b.signum()
     }
 
-    // refill buffer
+    // refill buffer; return pre-read position
     fn fill<F: FileHandler>(
         &mut self,
         wav: &mut active::Wav<F>,
         fs: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<u64, F::Error> {
+        wav.flush_seek(fs)?;
+        let init_pos = wav.pos(fs)?;
+
         let bytes = bytemuck::cast_slice_mut(&mut self.samples[..]);
-        let mut slice = bytes;
-        while !slice.is_empty() {
-            let n = fs.read(&mut wav.file, slice)?;
-            if n == 0 {
-                wav.seek(0, fs)?;
-            }
-            slice = &mut slice[n..];
-        }
+        wav.read(bytes, fs)?;
         // find zero xings about new grain
         let start = self.samples.windows(2).enumerate().find(|(_, w)| Self::is_zero_xing(w[0], w[1])).map(|(i, _)| i).unwrap_or(0);
         let end = self.samples.windows(2).enumerate().rev().find(|(_, w)| Self::is_zero_xing(w[0], w[1])).map(|(i, _)| i).unwrap_or(MAX_LEN - 1);
         self.bounds = start..end;
-        Ok(())
+
+        Ok(init_pos)
     }
 
     fn read_interpolated<F: FileHandler>(
@@ -73,16 +71,15 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
         wav: &mut active::Wav<F>,
         fs: &mut F,
     ) -> Result<f32, F::Error> {
-        let init_pos = wav.pos(fs)?;
         let init_bounds = self.bounds.clone();
 
         if self.bounds.is_empty() || self.index >= self.bounds.end as f32 {
-            self.fill(wav, fs)?;
-            wav.seek(init_pos as i64 + (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
+            let init_pos = self.fill(wav, fs)?;
+            wav.force_seek(init_pos as i64 + (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
             self.index = self.index - init_bounds.end as f32 + self.bounds.start as f32;
         } else if self.index < self.bounds.start as f32 {
-            self.fill(wav, fs)?;
-            wav.seek(init_pos as i64 - (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
+            let init_pos = self.fill(wav, fs)?;
+            wav.force_seek(init_pos as i64 - (self.bounds.len() as f32 * stretch) as i64 * 2, fs)?;
             self.index = self.index - init_bounds.start as f32 + self.bounds.end as f32;
         }
         // read sample with linear interpolation
@@ -116,23 +113,9 @@ impl<const PADS: usize> Kit<PADS> {
         index: impl Into<usize> + Copy,
         pan: f32,
         fs: &mut F,
-    ) -> Result<Option<active::Onset<F>>, F::Error> {
-        if let Some(passive::Onset { wav, start, .. }) = self.onsets[index.into()].as_ref() {
-            if let Some(file) = to_close {
-                fs.close(file)?;
-            }
-            let wav = active::Wav {
-                tempo: wav.tempo,
-                steps: wav.steps,
-                file: fs.open(&wav.path)?,
-                len: wav.len,
-            };
-            Ok(Some(active::Onset {
-                index: index.into() as u8,
-                pan,
-                wav,
-                start: *start,
-            }))
+    ) -> Result<Option<active::Onset<F>>, OpenError<F::Error>> {
+        if let Some(source) = self.onsets[index.into()].as_ref() {
+            Ok(Some(Self::onset_inner(source, to_close, index, pan, fs)?))
         } else {
             Ok(None)
         }
@@ -144,27 +127,77 @@ impl<const PADS: usize> Kit<PADS> {
         index: impl Into<usize> + Copy,
         pan: f32,
         fs: &mut F,
-    ) -> Result<Option<active::Onset<F>>, F::Error> {
-        if let Some(passive::Onset { wav, start, .. }) = self.onsets[index.into()].as_ref() {
-            if let Some(file) = to_close {
-                fs.close(file)?;
-            }
-            let mut wav = active::Wav {
-                tempo: wav.tempo,
-                steps: wav.steps,
-                file: fs.open(&wav.path)?,
-                len: wav.len,
-            };
-            wav.seek(*start as i64 * 2, fs)?;
-            Ok(Some(active::Onset {
-                index: index.into() as u8,
-                pan,
-                wav,
-                start: *start,
-            }))
+    ) -> Result<Option<active::Onset<F>>, OpenError<F::Error>> {
+        if let Some(source) = self.onsets[index.into()].as_ref() {
+            let mut onset = Self::onset_inner(source, to_close, index, pan, fs)?;
+            onset.wav.force_seek(source.start as i64 * 2, fs)?;
+            Ok(Some(onset))
         } else {
             Ok(None)
         }
+    }
+
+    fn onset_inner<F: FileHandler>(
+        source: &passive::Onset,
+        to_close: Option<&F::File>,
+        index: impl Into<usize> + Copy,
+        pan: f32,
+        fs: &mut F,
+    ) -> Result<active::Onset<F>, OpenError<F::Error>> {
+        if let Some(file) = to_close {
+            fs.close(file)?;
+        }
+        let mut file = fs.open(&source.wav.path)?;
+        // parse wav looking for `data` subchunk
+        let (pcm_start, pcm_len) = loop {
+            let mut id = [0u8; 4];
+            fs.read_exact(&mut file, &mut id).map_err(|e| match e {
+                ReadExactError::UnexpectedEof => OpenError::DataNotFound,
+                ReadExactError::Other(e) => OpenError::Other(e),
+            })?;
+            if &id[..] == b"RIFF" {
+                fs.seek(&mut file, embedded_io::SeekFrom::Current(4))?;
+                let mut data = [0u8; 4];
+                fs.read_exact(&mut file, &mut data).map_err(|e| match e {
+                    ReadExactError::UnexpectedEof => OpenError::DataNotFound,
+                    ReadExactError::Other(e) => OpenError::Other(e),
+                })?;
+                if &data[..] != b"WAVE" {
+                    return Err(OpenError::BadFormat);
+                }
+            } else if &id[..] == b"data" {
+                let mut size = [0u8; 4];
+                fs.read_exact(&mut file, &mut size).map_err(|e| match e {
+                    ReadExactError::UnexpectedEof => OpenError::DataNotFound,
+                    ReadExactError::Other(e) => OpenError::Other(e),
+                })?;
+                let pcm_start = fs.stream_position(&mut file)?;
+                let pcm_len = u32::from_le_bytes(size) as u64;
+                break (pcm_start, pcm_len);
+            } else {
+                let mut size = [0u8; 4];
+                fs.read_exact(&mut file, &mut size).map_err(|e| match e {
+                    ReadExactError::UnexpectedEof => OpenError::DataNotFound,
+                    ReadExactError::Other(e) => OpenError::Other(e),
+                })?;
+                let chunk_len = u32::from_le_bytes(size) as i64;
+                fs.seek(&mut file, embedded_io::SeekFrom::Current(chunk_len))?;
+            }
+        };
+        let wav = active::Wav {
+            tempo: source.wav.tempo,
+            steps: source.wav.steps,
+            file,
+            pcm_start,
+            pcm_len,
+            seek_to: None,
+        };
+        Ok(active::Onset {
+            index: index.into() as u8,
+            pan,
+            wav,
+            start: source.start,
+        })
     }
 }
 
@@ -316,18 +349,18 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             if self.tempo > 0. {
                 let pos = wav.pos(fs)?;
                 let len = if let Some(steps) = wav.steps {
-                    (*num as f32 / self.loop_div.net() * wav.len as f32 / steps as f32) as u64 & !1
+                    (*num as f32 / self.loop_div.net() * wav.pcm_len as f32 / steps as f32) as u64 & !1
                 } else {
                     (*num as f32 / self.loop_div.net() * SAMPLE_RATE as f32 * 60. / self.tempo
                         * self.loop_div.net()) as u64
                         & !1
                 };
                 let end = onset.start * 2 + len;
-                if pos > end || pos < onset.start && pos + wav.len > end {
+                if pos > end || pos < onset.start && pos + wav.pcm_len > end {
                     if self.reverse.is_some() {
-                        wav.seek(end as i64, fs)?;
+                        wav.push_seek(end as i64);
                     } else {
-                        wav.seek(onset.start as i64 * 2, fs)?;
+                        wav.push_seek(onset.start as i64 * 2);
                     }
                 }
             }
@@ -393,7 +426,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             .onsets[index as usize] = Some(onset);
     }
 
-    pub fn clock(&mut self, fs: &mut F, rand: &mut impl Rand) -> Result<(), F::Error> {
+    pub fn clock(&mut self, fs: &mut F, rand: &mut impl Rand) -> Result<(), OpenError<F::Error>> {
         if let Some(input) = self.input.buffer.take() {
             self.process_input(fs, rand, input)?;
         } else {
@@ -409,22 +442,22 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                         let wav = &mut onset.wav;
                         if let Some(steps) = wav.steps {
                             let clock = self.reverse.unwrap_or(self.clock);
-                            let offset = (wav.len as f32 / steps as f32 * (clock - *step as f32))
+                            let offset = (wav.pcm_len as f32 / steps as f32 * (clock - *step as f32))
                                 as i64
                                 & !1;
-                            wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                            wav.push_seek(onset.start as i64 * 2 + offset);
                         }
                     }
                     active::Event::Loop(onset, step, num) => {
                         let wav = &mut onset.wav;
                         if let Some(steps) = wav.steps {
                             let clock = self.reverse.unwrap_or(self.clock);
-                            let offset = (wav.len as f32 / steps as f32
+                            let offset = (wav.pcm_len as f32 / steps as f32
                                 * ((clock - *step as f32)
                                     .rem_euclid(*num as f32 / self.loop_div.net())))
                                 as i64
                                 & !1;
-                            wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                            wav.push_seek(onset.start as i64 * 2 + offset);
                         }
                     }
                     _ => (),
@@ -449,7 +482,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         rand: &mut impl Rand,
         event: passive::Event,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         self.input.active.trans(
             &event,
             self.clock as u16,
@@ -467,7 +500,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         rand: &mut impl Rand,
         event: passive::Event,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         if self.quant {
             self.input.buffer = Some(event);
         } else {
@@ -494,7 +527,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         rand: &mut impl Rand,
         len: u16,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         if self.record.active.is_none() {
             self.record.bake(self.clock as u16);
         }
@@ -528,7 +561,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         rand: &mut impl Rand,
         event: passive::Event,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), OpenError<F::Error>> {
         self.input.active.trans(
             &event,
             self.clock as u16,
@@ -545,7 +578,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         Ok(())
     }
 
-    fn tick_phrases(&mut self, fs: &mut F, rand: &mut impl Rand) -> Result<(), F::Error> {
+    fn tick_phrases(&mut self, fs: &mut F, rand: &mut impl Rand) -> Result<(), OpenError<F::Error>> {
         // advance record phrase, if any
         if let Some(active::Phrase {
             next,
@@ -690,7 +723,7 @@ impl<
         Ok(())
     }
 
-    pub fn tick(&mut self) -> Result<(), F::Error> {
+    pub fn tick(&mut self) -> Result<(), OpenError<F::Error>> {
         for bank in self.banks.iter_mut() {
             bank.quant = true;
             bank.clock(&mut self.fs, &mut self.rand)?;

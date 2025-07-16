@@ -1,6 +1,6 @@
 //! read-only data types
 
-use crate::{active, pads, FileHandler};
+use crate::{active, pads, FileHandler, OpenError};
 
 use tinyrand::Rand;
 
@@ -73,7 +73,7 @@ impl<const STEPS: usize> Phrase<STEPS> {
         phrase_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<Option<active::Phrase<F>>, F::Error> {
+    ) -> Result<Option<active::Phrase<F>>, OpenError<F::Error>> {
         if let Some(active) = active.as_mut() {
             if self.events.first().is_some_and(|v| v.step == 0) {
                 // phrase events start on first step
@@ -148,7 +148,7 @@ impl<const STEPS: usize> Phrase<STEPS> {
         phrase_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<Option<u16>, F::Error> {
+    ) -> Result<Option<u16>, OpenError<F::Error>> {
         let drift = phrase_drift * self.events.len() as f32;
         let drift = rand.next_lim_usize(drift as usize + 1)
             + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;
