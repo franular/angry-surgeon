@@ -8,17 +8,6 @@ use tinyrand::Rand;
 #[allow(unused_imports)]
 use micromath::F32Ext;
 
-/// upcoming source events; consumes input event buffer
-macro_rules! sources {
-    ($bank_hdlr:expr) => {
-        [
-            &Some($bank_hdlr.input.buffer),
-            &$bank_hdlr.record.next_step(),
-            &$bank_hdlr.sequence.next_step(&$bank_hdlr.bank),
-        ]
-    };
-}
-
 macro_rules! actives {
     (ref $bank_hdlr:expr) => {
         [
@@ -45,20 +34,6 @@ macro_rules! actives {
                 .as_mut()
                 .map(|v| &mut v.active),
         ]
-    };
-}
-
-macro_rules! active_from {
-    ($bank_hdlr:expr) => {
-        if let Some(event) = actives!($bank_hdlr)
-            .into_iter()
-            .flat_map(|v| v.and_then(|v| v.non_sync()))
-            .next()
-        {
-            event
-        } else {
-            &mut active::Event::Sync
-        }
     };
 }
 
@@ -449,6 +424,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_grain<T: core::ops::AddAssign + From<f32>>(
         tempo: f32,
         step_div: u16,
@@ -487,11 +463,17 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
 
     fn tick(&mut self, rand: &mut impl Rand, fs: &mut F) -> Result<(), Error<F::Error>> {
         self.quant = true;
-        let input_event = self
-            .input
-            .tick(&self.bank, self.kit_index, self.kit_drift, rand, fs)?;
+        let input_event = self.input.tick(
+            self.loop_div.net(),
+            &self.bank,
+            self.kit_index,
+            self.kit_drift,
+            rand,
+            fs,
+        )?;
         let record_event = self.record.tick(
             self.input.active.reverse,
+            self.loop_div.net(),
             &self.bank,
             self.kit_index,
             self.kit_drift,
@@ -501,6 +483,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         )?;
         let sequence_event = self.sequence.tick(
             self.input.active.reverse,
+            self.loop_div.net(),
             &self.bank,
             self.kit_index,
             self.kit_drift,

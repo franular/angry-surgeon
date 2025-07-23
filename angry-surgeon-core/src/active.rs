@@ -219,6 +219,41 @@ impl<F: FileHandler> Active<F> {
             None
         }
     }
+
+    /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`, push seek to sync to
+    /// tick offset from onset
+    pub fn tick(&mut self, xor_reverse: bool, loop_div: f32) {
+        match &mut self.event {
+            Event::Sync => (),
+            Event::Hold { onset, tick } => {
+                if self.reverse ^ xor_reverse {
+                    *tick -= 1;
+                } else {
+                    *tick += 1;
+                }
+                let wav = &mut onset.wav;
+                if let Some(steps) = wav.steps {
+                    let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
+                    wav.push_seek(onset.start as i64 * 2 + offset);
+                }
+            }
+            Event::Loop { onset, tick, len } => {
+                if self.reverse ^ xor_reverse {
+                    *tick -= 1;
+                } else {
+                    *tick += 1;
+                }
+                let wav = &mut onset.wav;
+                if let Some(steps) = wav.steps {
+                    let offset = (wav.pcm_len as f32 / steps as f32
+                        * (*tick as f32).rem_euclid(*len as f32 / loop_div))
+                        as i64
+                        & !1;
+                    wav.push_seek(onset.start as i64 * 2 + offset);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct Input<F: FileHandler> {
@@ -238,6 +273,7 @@ impl<F: FileHandler> Default for Input<F> {
 impl<F: FileHandler> Input<F> {
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
+        loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
@@ -249,12 +285,8 @@ impl<F: FileHandler> Input<F> {
                 .event
                 .trans(&event, bank, kit_index, kit_drift, rand, fs)?;
             return Ok(Some(event));
-        } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } = &mut self.active.event {
-            if self.active.reverse {
-                *tick -= 1;
-            } else {
-                *tick += 1;
-            }
+        } else {
+            self.active.tick(false, loop_div);
         }
         Ok(None)
     }
@@ -292,7 +324,8 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
     #[allow(clippy::too_many_arguments)]
     pub fn tick<const PADS: usize>(
         &mut self,
-        reverse: bool,
+        xor_reverse: bool,
+        loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
@@ -316,15 +349,8 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
                         .event
                         .trans(event, bank, kit_index, kit_drift, rand, fs)?;
                     return Ok(Some(*event));
-                } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } =
-                    &mut active_phrase.active.event
-                {
-                    // in-/decrement tick
-                    if active_phrase.active.reverse ^ reverse {
-                        *tick -= 1;
-                    } else {
-                        *tick += 1;
-                    }
+                } else {
+                    active_phrase.active.tick(xor_reverse, loop_div);
                 }
             } else {
                 // start active phrase from empty
@@ -402,7 +428,8 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
     #[allow(clippy::too_many_arguments)]
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
-        reverse: bool,
+        xor_reverse: bool,
+        loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
@@ -462,15 +489,8 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                     .event
                     .trans(event, bank, kit_index, kit_drift, rand, fs)?;
                 return Ok(Some(*event));
-            } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } =
-                &mut active_phrase.active.event
-            {
-                // in-/decrement tick
-                if active_phrase.active.reverse ^ reverse {
-                    *tick -= 1;
-                } else {
-                    *tick += 1;
-                }
+            } else {
+                active_phrase.active.tick(xor_reverse, loop_div);
             }
         } else if let Some(source_phrase) = Self::try_increment_phrase(
             &mut self.phrase_index,
