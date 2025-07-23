@@ -1,15 +1,17 @@
 //! stateful data types
 
-use crate::{pads, passive, FileHandler, OpenError};
-use core::mem::MaybeUninit;
-use heapless::{Deque, Vec};
+use std::mem::MaybeUninit;
+
+use crate::{pads, passive, Error, FileHandler};
+use embedded_io::SeekFrom;
 use tinyrand::Rand;
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use micromath::F32Ext;
 
-pub struct Wav<F: FileHandler> {
+#[derive(Clone)]
+pub(crate) struct Wav<F: FileHandler> {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
     pub file: F::File,
@@ -24,11 +26,11 @@ impl<F: FileHandler> Wav<F> {
     }
 
     pub fn force_seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
-        println!("//r:{}", fs.seek(
+        fs.seek(
             &mut self.file,
-            embedded_io::SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
-        )?);
-        Ok(())
+            SeekFrom::Start(self.pcm_start - offset.rem_euclid(self.pcm_len as i64) as u64),
+        )
+        .map(|_| ())
     }
 
     pub fn push_seek(&mut self, offset: i64) {
@@ -37,10 +39,7 @@ impl<F: FileHandler> Wav<F> {
 
     pub fn flush_seek(&mut self, fs: &mut F) -> Result<(), F::Error> {
         if let Some(offset) = self.seek_to.take() {
-            println!("//l:{}", fs.seek(
-                &mut self.file,
-                embedded_io::SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
-            )?);
+            self.force_seek(offset, fs)?;
         }
         Ok(())
     }
@@ -59,35 +58,40 @@ impl<F: FileHandler> Wav<F> {
     }
 }
 
-pub struct Onset<F: FileHandler> {
-    /// source onset index
+pub(crate) struct Onset<F: FileHandler> {
+    /// pad index of source onset
     pub index: u8,
     pub pan: f32,
     pub wav: Wav<F>,
     pub start: u64,
 }
 
-pub enum Event<F: FileHandler> {
+pub(crate) enum Event<F: FileHandler> {
     Sync,
-    Hold(Onset<F>, u16),
-    Loop(Onset<F>, u16, u16),
+    Hold {
+        onset: Onset<F>,
+        tick: u16,
+    },
+    Loop {
+        onset: Onset<F>,
+        tick: u16,
+        len: u16,
+    },
 }
 
 impl<F: FileHandler> Event<F> {
-    #[allow(clippy::too_many_arguments)]
     pub fn trans<const PADS: usize, const STEPS: usize>(
         &mut self,
         input: &passive::Event,
-        step: u16,
         bank: &pads::Bank<PADS, STEPS>,
-        kit_index: usize,
+        kit_index: u8,
         kit_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<(), OpenError<F::Error>> {
+    ) -> Result<(), Error<F::Error>> {
         match input {
             passive::Event::Sync => {
-                if let Event::Hold(onset, ..) | Event::Loop(onset, ..) = self {
+                if let Event::Hold { onset, .. } | Event::Loop { onset, .. } = self {
                     // close old file
                     fs.close(&onset.wav.file)?;
                 }
@@ -95,8 +99,34 @@ impl<F: FileHandler> Event<F> {
             }
             passive::Event::Hold { index } => {
                 match self {
-                    Event::Loop(onset, ..) => {
-                        // recast event variant with same Onset
+                    Event::Sync => {
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // replace onset; no old file to close
+                            if let Some(onset) = kit.onset_seek(
+                                None,
+                                *index,
+                                pads::Kit::<PADS>::generate_pan(*index),
+                                fs,
+                            )? {
+                                *self = Event::Hold { onset, tick: 0 };
+                            }
+                        }
+                    }
+                    Event::Hold { onset, .. } => {
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // close old file and replace onset
+                            if let Some(onset) = kit.onset_seek(
+                                Some(&onset.wav.file),
+                                *index,
+                                pads::Kit::<PADS>::generate_pan(*index),
+                                fs,
+                            )? {
+                                *self = Event::Hold { onset, tick: 0 };
+                            }
+                        }
+                    }
+                    Event::Loop { onset, .. } => {
+                        // recast event variant with same onset
                         let uninit: &mut MaybeUninit<Onset<F>> =
                             unsafe { core::mem::transmute(onset) };
                         let mut onset = unsafe {
@@ -104,33 +134,30 @@ impl<F: FileHandler> Event<F> {
                         };
                         // i don't know either, girl
                         onset.wav.file = fs.try_clone(&onset.wav.file)?;
-                        *self = Event::Hold(onset, step);
-                    }
-                    Event::Hold(onset, ..) => {
-                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
-                            // close old file and replace onset
-                            if let Some(new) =
-                                kit.onset_seek(Some(&onset.wav.file), *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
-                            {
-                                *self = Event::Hold(new, step);
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
-                            // replace onset; no old file to close
-                            if let Some(onset) =
-                                kit.onset_seek(None, *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
-                            {
-                                *self = Event::Hold(onset, step);
-                            }
-                        }
+                        *self = Event::Hold { onset, tick: 0 };
                     }
                 }
             }
             passive::Event::Loop { index, len } => {
                 match self {
-                    Event::Hold(onset, step) | Event::Loop(onset, step, ..) => {
+                    Event::Sync => {
+                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            // replace onset; no old file to close
+                            if let Some(onset) = kit.onset(
+                                None,
+                                *index,
+                                pads::Kit::<PADS>::generate_pan(*index),
+                                fs,
+                            )? {
+                                *self = Event::Loop {
+                                    onset,
+                                    tick: 0,
+                                    len: *len,
+                                };
+                            }
+                        }
+                    }
+                    Event::Hold { onset, tick } | Event::Loop { onset, tick, .. } => {
                         if onset.index == *index {
                             // recast event variant with same Onset
                             let uninit: &mut MaybeUninit<Onset<F>> =
@@ -140,23 +167,24 @@ impl<F: FileHandler> Event<F> {
                             };
                             // i don't know either, girl
                             onset.wav.file = fs.try_clone(&onset.wav.file)?;
-                            *self = Event::Loop(onset, *step, *len);
+                            *self = Event::Loop {
+                                onset,
+                                tick: *tick,
+                                len: *len,
+                            };
                         } else if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
                             // close old file and replace onset
-                            if let Some(new) =
-                                kit.onset(Some(&onset.wav.file), *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
-                            {
-                                *self = Event::Loop(new, *step, *len);
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
-                            // replace onset; no old file to close
-                            if let Some(onset) =
-                                kit.onset(None, *index, pads::Kit::<PADS>::generate_pan(*index), fs)?
-                            {
-                                *self = Event::Loop(onset, step, *len);
+                            if let Some(onset) = kit.onset(
+                                Some(&onset.wav.file),
+                                *index,
+                                pads::Kit::<PADS>::generate_pan(*index),
+                                fs,
+                            )? {
+                                *self = Event::Loop {
+                                    onset,
+                                    tick: *tick,
+                                    len: *len,
+                                };
                             }
                         }
                     }
@@ -167,189 +195,345 @@ impl<F: FileHandler> Event<F> {
     }
 }
 
-pub struct Input<F: FileHandler> {
-    pub active: Event<F>,
-    pub buffer: Option<passive::Event>,
+/// active event and reverse
+pub(crate) struct Active<F: FileHandler> {
+    pub event: Event<F>,
+    /// reverse start tick
+    pub reverse: bool,
+}
+
+impl<F: FileHandler> Default for Active<F> {
+    fn default() -> Self {
+        Self {
+            event: Event::Sync,
+            reverse: false,
+        }
+    }
+}
+
+impl<F: FileHandler> Active<F> {
+    pub fn non_sync(&mut self) -> Option<&mut Event<F>> {
+        if !matches!(self.event, Event::Sync) {
+            Some(&mut self.event)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct Input<F: FileHandler> {
+    pub buffer: passive::Step,
+    pub active: Active<F>,
+}
+
+impl<F: FileHandler> Default for Input<F> {
+    fn default() -> Self {
+        Self {
+            buffer: passive::Step::default(),
+            active: Active::default(),
+        }
+    }
 }
 
 impl<F: FileHandler> Input<F> {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            active: Event::Sync,
-            buffer: None,
+    pub fn tick<const PADS: usize, const STEPS: usize>(
+        &mut self,
+        bank: &pads::Bank<PADS, STEPS>,
+        kit_index: u8,
+        kit_drift: f32,
+        rand: &mut impl Rand,
+        fs: &mut F,
+    ) -> Result<Option<passive::Event>, Error<F::Error>> {
+        if let Some(event) = self.buffer.event.take() {
+            self.active
+                .event
+                .trans(&event, bank, kit_index, kit_drift, rand, fs)?;
+            return Ok(Some(event));
+        } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } = &mut self.active.event {
+            if self.active.reverse {
+                *tick -= 1;
+            } else {
+                *tick += 1;
+            }
         }
+        Ok(None)
     }
 }
 
-pub struct Phrase<F: FileHandler> {
-    /// next event index (sans drift)
-    pub next: usize,
-    /// remaining steps in event
-    pub event_rem: u16,
-    /// remaining steps in phrase
-    pub phrase_rem: u16,
-    /// active event (last consumed)
-    pub active: Event<F>,
+/// running phrase reading from **last** `step_count` steps of active
+pub(crate) struct Phrase<F: FileHandler> {
+    /// step index sans drift
+    pub step_index: u16,
+    /// phrase length
+    pub step_count: u16,
+    pub active: Active<F>,
 }
 
-pub struct Record<const STEPS: usize, F: FileHandler> {
-    /// running bounded event queue
-    events: Deque<passive::Stamped, STEPS>,
-    /// baked events
-    buffer: Vec<passive::Stamped, STEPS>,
+pub(crate) struct Record<const STEPS: usize, F: FileHandler> {
+    /// running step queue
+    queue: heapless::Deque<passive::Step, STEPS>,
     /// trimmed source phrase, if any
-    pub phrase: Option<passive::Phrase<STEPS>>,
+    pub source_phrase: Option<passive::Phrase<STEPS>>,
     /// active phrase, if any
-    pub active: Option<Phrase<F>>,
+    pub active_phrase: Option<Phrase<F>>,
+}
+
+impl<const STEPS: usize, F: FileHandler> Default for Record<STEPS, F> {
+    fn default() -> Self {
+        Self {
+            queue: heapless::Deque::new(),
+            source_phrase: None,
+            active_phrase: None,
+        }
+    }
 }
 
 impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            events: Deque::new(),
-            buffer: Vec::new(),
-            phrase: None,
-            active: None,
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick<const PADS: usize>(
+        &mut self,
+        reverse: bool,
+        bank: &pads::Bank<PADS, STEPS>,
+        kit_index: u8,
+        kit_drift: f32,
+        phrase_drift: f32,
+        rand: &mut impl Rand,
+        fs: &mut F,
+    ) -> Result<Option<passive::Event>, Error<F::Error>> {
+        if let Some(source_phrase) = self.source_phrase.as_ref() {
+            if let Some(active_phrase) = self.active_phrase.as_mut() {
+                // increment step
+                active_phrase.step_index =
+                    (active_phrase.step_index + 1) % active_phrase.step_count;
+                let step =
+                    source_phrase.generate_step(active_phrase.step_index, phrase_drift, rand);
+
+                active_phrase.active.reverse = step.reverse;
+                // process event
+                if let Some(ref event) = step.event {
+                    active_phrase
+                        .active
+                        .event
+                        .trans(event, bank, kit_index, kit_drift, rand, fs)?;
+                    return Ok(Some(*event));
+                } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } =
+                    &mut active_phrase.active.event
+                {
+                    // in-/decrement tick
+                    if active_phrase.active.reverse ^ reverse {
+                        *tick -= 1;
+                    } else {
+                        *tick += 1;
+                    }
+                }
+            } else {
+                // start active phrase from empty
+                let step = source_phrase.generate_step(0, phrase_drift, rand);
+                let mut event = Event::Sync;
+                let ret = if let Some(ref source) = step.event {
+                    event.trans(source, bank, kit_index, kit_drift, rand, fs)?;
+                    Some(*source)
+                } else {
+                    None
+                };
+                self.active_phrase = Some(Phrase {
+                    step_index: 0,
+                    step_count: source_phrase.len,
+                    active: Active {
+                        event,
+                        reverse: step.reverse,
+                    },
+                });
+                return Ok(ret);
+            }
         }
+        Ok(None)
     }
 
-    pub fn push(&mut self, event: passive::Event, step: u16) {
-        // remove steps beyond max phrase len
-        while self
-            .events
-            .front()
-            .is_some_and(|v| step - v.step > STEPS as u16)
-        {
-            self.events.pop_front();
-        }
-        let _ = self.events.push_back(passive::Stamped { event, step });
+    pub fn push(&mut self, step: passive::Step) {
+        let _ = self.queue.push_back(step);
     }
 
-    pub fn bake(&mut self, step: u16) {
-        self.buffer = self
-            .events
-            .iter()
-            .flat_map(|v| {
-                Some(passive::Stamped {
-                    event: v.event.clone(),
-                    step: (v.step + STEPS as u16).checked_sub(step)?,
-                })
-            })
-            .collect::<Vec<_, STEPS>>();
+    pub fn save(&mut self) {
+        let mut steps = [passive::Step::default(); STEPS];
+        let (front, back) = self.queue.as_slices();
+        if !front.is_empty() {
+            steps[..front.len()].copy_from_slice(front);
+        }
+        if !back.is_empty() {
+            steps[front.len()..][..back.len()].copy_from_slice(back);
+        }
+        self.source_phrase = Some(passive::Phrase {
+            steps,
+            len: self.queue.len() as u16,
+        });
     }
 
     pub fn trim(&mut self, len: u16) {
-        let events = self
-            .buffer
-            .iter()
-            .flat_map(|v| {
-                Some(passive::Stamped {
-                    event: v.event.clone(),
-                    step: (v.step + len).checked_sub(STEPS as u16)?,
-                })
-            })
-            .collect::<Vec<_, STEPS>>();
-        self.phrase = Some(passive::Phrase { events, len });
+        if let Some(phrase) = self.source_phrase.as_mut() {
+            phrase.len = len;
+        }
     }
+}
 
+pub(crate) struct Sequence<const PHRASES: usize, F: FileHandler> {
+    /// sequence index sans drift
+    phrase_index: u16,
+    /// sequence of source phrase indices
+    phrases: heapless::Vec<u8, PHRASES>,
+    /// pad index of source phrase, if any
+    source_phrase: Option<u8>,
+    /// active phrase, if any
+    pub active_phrase: Option<Phrase<F>>,
+}
+
+impl<const PHRASES: usize, F: FileHandler> Default for Sequence<PHRASES, F> {
+    fn default() -> Self {
+        Self {
+            phrase_index: 0,
+            phrases: heapless::Vec::new(),
+            source_phrase: None,
+            active_phrase: None,
+        }
+    }
+}
+
+impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_phrase<const PADS: usize>(
+    pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
-        step: u16,
+        reverse: bool,
         bank: &pads::Bank<PADS, STEPS>,
-        kit_index: usize,
+        kit_index: u8,
         kit_drift: f32,
         phrase_drift: f32,
         rand: &mut impl Rand,
         fs: &mut F,
-    ) -> Result<(), OpenError<F::Error>> {
-        if let Some(phrase) = self.phrase.as_mut() {
-            if let Some(phrase) = phrase.generate_active(
-                &mut self.active,
-                step,
+    ) -> Result<Option<passive::Event>, Error<F::Error>> {
+        if let Some(active_phrase) = self.active_phrase.as_mut() {
+            let source_phrase = if let Some(source_phrase) = self
+                .source_phrase
+                .and_then(|v| bank.phrases[v as usize].as_ref())
+            {
+                if active_phrase.step_index >= active_phrase.step_count {
+                    if let Some(source_phrase) = Self::try_increment_phrase(
+                        &mut self.phrase_index,
+                        &self.phrases,
+                        &mut self.source_phrase,
+                        bank,
+                        phrase_drift,
+                        rand,
+                    ) {
+                        // incremented phrase
+                        active_phrase.step_count = source_phrase.len;
+                        active_phrase.step_index %= active_phrase.step_count;
+                        source_phrase
+                    } else {
+                        self.active_phrase = None;
+                        return Ok(None);
+                    }
+                } else {
+                    // increment step
+                    active_phrase.step_index += 1;
+                    source_phrase
+                }
+            } else if let Some(source_phrase) = Self::try_increment_phrase(
+                &mut self.phrase_index,
+                &self.phrases,
+                &mut self.source_phrase,
                 bank,
-                kit_index,
-                kit_drift,
                 phrase_drift,
                 rand,
-                fs,
-            )? {
-                self.active = Some(phrase);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn take(&mut self) -> Option<(passive::Phrase<STEPS>, Phrase<F>)> {
-        self.buffer.clear();
-        Some((self.phrase.take()?, self.active.take()?))
-    }
-}
-
-pub struct Pool<const PHRASES: usize, F: FileHandler> {
-    /// next phrase index (sans drift)
-    pub next: usize,
-    /// base phrase sequence
-    pub phrases: Vec<u8, PHRASES>,
-    /// pad index of source phrase, if any
-    pub index: Option<u8>,
-    /// active phrase, if any
-    pub active: Option<Phrase<F>>,
-}
-
-impl<const PHRASES: usize, F: FileHandler> Pool<PHRASES, F> {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            next: 0,
-            phrases: Vec::new(),
-            index: None,
-            active: None,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_phrase<'d, const PADS: usize, const STEPS: usize>(
-        &'d mut self,
-        step: u16,
-        bank: &'d pads::Bank<PADS, STEPS>,
-        kit_index: usize,
-        kit_drift: f32,
-        phrase_drift: f32,
-        rand: &mut impl Rand,
-        fs: &mut F,
-    ) -> Result<(), OpenError<F::Error>> {
-        if self.phrases.is_empty() {
-            self.next = 0;
-            self.active = None;
-        } else {
-            let index = {
-                // FIXME: use independent phrase_drift instead of same "stamped_drift"?
-                let drift = rand.next_lim_usize(
-                    ((phrase_drift * self.phrases.len() as f32 - 1.).round()) as usize + 1,
-                );
-                let index = (self.next + drift) % self.phrases.len();
-                self.phrases[index]
+            ) {
+                // incremented phrase
+                active_phrase.step_count = source_phrase.len;
+                active_phrase.step_index %= active_phrase.step_count;
+                source_phrase
+            } else {
+                self.active_phrase = None;
+                return Ok(None);
             };
-            self.index = Some(index);
-            if let Some(phrase) = &bank.phrases[index as usize] {
-                if let Some(phrase) = phrase.generate_active(
-                    &mut self.active,
-                    step,
-                    bank,
-                    kit_index,
-                    kit_drift,
-                    phrase_drift,
-                    rand,
-                    fs,
-                )? {
-                    self.active = Some(phrase);
+            // process step
+            let step = source_phrase.generate_step(active_phrase.step_index, phrase_drift, rand);
+            active_phrase.active.reverse = step.reverse;
+            if let Some(ref event) = step.event {
+                active_phrase
+                    .active
+                    .event
+                    .trans(event, bank, kit_index, kit_drift, rand, fs)?;
+                return Ok(Some(*event));
+            } else if let Event::Hold { tick, .. } | Event::Loop { tick, .. } =
+                &mut active_phrase.active.event
+            {
+                // in-/decrement tick
+                if active_phrase.active.reverse ^ reverse {
+                    *tick -= 1;
+                } else {
+                    *tick += 1;
                 }
             }
-            self.next = (self.next + 1) % self.phrases.len();
+        } else if let Some(source_phrase) = Self::try_increment_phrase(
+            &mut self.phrase_index,
+            &self.phrases,
+            &mut self.source_phrase,
+            bank,
+            phrase_drift,
+            rand,
+        ) {
+            // start active phrase from empty
+            let step = source_phrase.generate_step(0, phrase_drift, rand);
+            let mut event = Event::Sync;
+            let ret = if let Some(ref source) = step.event {
+                event.trans(source, bank, kit_index, kit_drift, rand, fs)?;
+                Some(*source)
+            } else {
+                None
+            };
+            self.active_phrase = Some(Phrase {
+                step_index: 0,
+                step_count: source_phrase.len,
+                active: Active {
+                    event,
+                    reverse: step.reverse,
+                },
+            });
+            return Ok(ret);
+        } else {
+            self.active_phrase = None;
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// associated method to appease borrow rules
+    fn try_increment_phrase<'d, const PADS: usize, const STEPS: usize>(
+        phrase_index: &mut u16,
+        phrases: &heapless::Vec<u8, PHRASES>,
+        source_phrase: &mut Option<u8>,
+        bank: &'d pads::Bank<PADS, STEPS>,
+        phrase_drift: f32,
+        rand: &mut impl Rand,
+    ) -> Option<&'d passive::Phrase<STEPS>> {
+        // try increment phrase
+        let phrase_count = phrases
+            .iter()
+            .filter(|v| bank.phrases[**v as usize].is_some())
+            .count();
+        if phrase_count != 0 {
+            *phrase_index = (*phrase_index + 1) % phrase_count as u16;
+            *source_phrase = {
+                let drift = phrase_drift * phrase_count as f32;
+                let drift = rand.next_lim_usize(drift as usize + 1)
+                    + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;
+                let index = (*phrase_index as usize + drift) % phrase_count;
+                phrases
+                    .iter()
+                    .cycle()
+                    .filter(|v| bank.phrases[**v as usize].is_some())
+                    .nth(index)
+                    .copied()
+            };
+            return source_phrase.and_then(|v| bank.phrases[v as usize].as_ref());
+        }
+        None
     }
 }

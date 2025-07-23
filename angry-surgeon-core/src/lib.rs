@@ -8,19 +8,19 @@ mod active;
 mod pads;
 mod passive;
 
-pub use pads::{Bank, SystemHandler};
-pub use passive::{Event, Onset, Phrase, Rd, Wav};
+// pub use pads::{Bank, SystemHandler};
+// pub use passive::{Event, Onset, Phrase, Rd, Wav};
 
 pub const GRAIN_LEN: usize = 512;
 
 #[derive(Debug)]
-pub enum OpenError<E: Debug> {
+pub enum Error<E: Debug> {
     BadFormat,
     DataNotFound,
     Other(E),
 }
 
-impl<E: Debug + Display> core::fmt::Display for OpenError<E> {
+impl<E: Debug + Display> core::fmt::Display for Error<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::BadFormat => write!(f, "bad format"),
@@ -30,9 +30,9 @@ impl<E: Debug + Display> core::fmt::Display for OpenError<E> {
     }
 }
 
-impl<E: Debug + Display> core::error::Error for OpenError<E> {}
+impl<E: Debug + Display> core::error::Error for Error<E> {}
 
-impl<E: Debug> From<E> for OpenError<E> {
+impl<E: Debug> From<E> for Error<E> {
     fn from(value: E) -> Self {
         Self::Other(value)
     }
@@ -70,7 +70,11 @@ pub trait FileHandler: ErrorType {
     /// Seek to an offset, in bytes, in a stream.
     fn seek(&mut self, file: &mut Self::File, pos: SeekFrom) -> Result<u64, Self::Error>;
 
-    fn read_exact(&mut self, file: &mut Self::File, buf: &mut [u8]) -> Result<(), ReadExactError<Self::Error>> {
+    fn read_exact(
+        &mut self,
+        file: &mut Self::File,
+        buf: &mut [u8],
+    ) -> Result<(), ReadExactError<Self::Error>> {
         let mut slice = &mut buf[..];
         while !slice.is_empty() {
             let n = self.read(file, slice)?;
