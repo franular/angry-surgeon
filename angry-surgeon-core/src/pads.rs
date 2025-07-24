@@ -100,14 +100,14 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
     ) -> Result<f32, F::Error> {
         let init_bounds = self.bounds.clone();
 
-        if self.bounds.is_empty() || self.index >= self.bounds.end as f32 {
+        if self.bounds.is_empty() || self.index as i64 >= self.bounds.end as i64 {
             let init_pos = self.fill(wav, fs)?;
             wav.force_seek(
                 init_pos as i64 + (self.bounds.len() as f32 * stretch) as i64 * 2,
                 fs,
             )?;
             self.index = self.index - init_bounds.end as f32 + self.bounds.start as f32;
-        } else if self.index < self.bounds.start as f32 {
+        } else if (self.index as i64) < self.bounds.start as i64 {
             let init_pos = self.fill(wav, fs)?;
             wav.force_seek(
                 init_pos as i64 - (self.bounds.len() as f32 * stretch) as i64 * 2,
@@ -132,9 +132,9 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Kit<const PADS: usize> {
+pub struct Kit<const PADS: usize> {
     #[serde(with = "serde_arrays")]
-    onsets: [Option<passive::Onset>; PADS],
+    pub onsets: [Option<passive::Onset>; PADS],
 }
 
 impl<const PADS: usize> Default for Kit<PADS> {
@@ -146,11 +146,11 @@ impl<const PADS: usize> Default for Kit<PADS> {
 }
 
 impl<const PADS: usize> Kit<PADS> {
-    pub fn generate_pan(index: impl Into<usize>) -> f32 {
+    pub(crate) fn generate_pan(index: impl Into<usize>) -> f32 {
         index.into() as f32 / PADS as f32 - 0.5
     }
 
-    pub fn onset<F: FileHandler>(
+    pub(crate) fn onset<F: FileHandler>(
         &self,
         to_close: Option<&F::File>,
         index: u8,
@@ -164,7 +164,7 @@ impl<const PADS: usize> Kit<PADS> {
         }
     }
 
-    pub fn onset_seek<F: FileHandler>(
+    pub(crate) fn onset_seek<F: FileHandler>(
         &self,
         to_close: Option<&F::File>,
         index: u8,
@@ -245,9 +245,9 @@ impl<const PADS: usize> Kit<PADS> {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Bank<const PADS: usize, const STEPS: usize> {
+pub struct Bank<const PADS: usize, const STEPS: usize> {
     #[serde(with = "serde_arrays")]
-    kits: [Option<Kit<PADS>>; PADS],
+    pub kits: [Option<Kit<PADS>>; PADS],
     #[serde(with = "serde_arrays")]
     pub phrases: [Option<passive::Phrase<STEPS>>; PADS],
 }
@@ -263,7 +263,7 @@ impl<const PADS: usize, const STEPS: usize> Default for Bank<PADS, STEPS> {
 
 impl<const PADS: usize, const STEPS: usize> Bank<PADS, STEPS> {
     /// find first non-None kit, if any, at `drift` indices from base `index`
-    pub fn generate_kit(
+    pub(crate) fn generate_kit(
         &self,
         mut index: u8,
         drift: f32,
@@ -351,7 +351,74 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         }
     }
 
-    pub fn read_attenuated<T: core::ops::AddAssign + From<f32>>(
+    pub fn assign_onset(&mut self, pad_index: u8, onset: passive::Onset) {
+        self.bank.kits[self.kit_index as usize]
+            .get_or_insert_default()
+            .onsets[pad_index as usize] = Some(onset);
+    }
+
+    pub fn force_event(
+        &mut self,
+        event: passive::Event,
+        rand: &mut impl Rand,
+        fs: &mut F,
+    ) -> Result<(), Error<F::Error>> {
+        self.input.active.event.trans(
+            &event,
+            &self.bank,
+            self.kit_index,
+            self.kit_drift,
+            rand,
+            fs,
+        )?;
+        Ok(())
+    }
+
+    pub fn push_event(
+        &mut self,
+        event: passive::Event,
+        rand: &mut impl Rand,
+        fs: &mut F,
+    ) -> Result<(), Error<F::Error>> {
+        if self.quant {
+            self.input.buffer.event = Some(event);
+        } else {
+            self.force_event(event, rand, fs)?;
+        }
+        Ok(())
+    }
+
+    pub fn push_reverse(&mut self, reverse: bool) {
+        if self.quant {
+            self.input.buffer.reverse = reverse;
+        } else {
+            self.input.active.reverse = reverse;
+        }
+    }
+
+    pub fn trim_record(&mut self, len: u16) {
+        self.record.trim(len);
+    }
+
+    pub fn take_record(&mut self, index: Option<u8>) {
+        if let Some(source) = self.record.take() {
+            if let Some(index) = index {
+                self.bank.phrases[index as usize] = Some(source);
+                self.sequence.clear();
+                self.sequence.push(index);
+            }
+        }
+    }
+
+    pub fn clear_sequence(&mut self) {
+        self.sequence.clear();
+    }
+
+    pub fn push_sequence(&mut self, index: u8) {
+        self.sequence.push(index);
+    }
+
+    fn read_attenuated<T: core::ops::AddAssign + From<f32>>(
         &mut self,
         fs: &mut F,
         buffer: &mut [T],
@@ -424,6 +491,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         }
     }
 
+    /// associated method to appease borrow rules
     #[allow(clippy::too_many_arguments)]
     fn read_grain<T: core::ops::AddAssign + From<f32>>(
         tempo: f32,
@@ -453,12 +521,6 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             buffer[i * channels + 1] += T::from(r);
         }
         Ok(())
-    }
-
-    pub fn assign_onset(&mut self, pad_index: u8, onset: passive::Onset) {
-        self.bank.kits[self.kit_index as usize]
-            .get_or_insert_default()
-            .onsets[pad_index as usize] = Some(onset);
     }
 
     fn tick(&mut self, rand: &mut impl Rand, fs: &mut F) -> Result<(), Error<F::Error>> {
@@ -523,28 +585,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
     }
 
     fn stop(&mut self) {
-        todo!()
-    }
-
-    pub fn push_reverse(&mut self, reverse: bool) {
-        self.input.buffer.reverse = reverse;
-    }
-
-    pub fn force_event(
-        &mut self,
-        event: passive::Event,
-        rand: &mut impl Rand,
-        fs: &mut F,
-    ) -> Result<(), Error<F::Error>> {
-        self.input.active.event.trans(
-            &event,
-            &self.bank,
-            self.kit_index,
-            self.kit_drift,
-            rand,
-            fs,
-        )?;
-        Ok(())
+        self.quant = false;
     }
 
     fn reverse(&self) -> bool {
@@ -560,5 +601,52 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                     .as_ref()
                     .map(|v| v.active.reverse))
                 .unwrap_or_default()
+    }
+}
+
+pub struct SystemHandler<const BANKS: usize, const PADS: usize, const STEPS: usize, const PHRASES: usize, R: Rand, F: FileHandler> {
+    pub banks: [BankHandler<PADS, STEPS, PHRASES, F>; BANKS],
+    pub rand: R,
+    pub fs: F,
+}
+
+impl<const BANKS: usize, const PADS: usize, const STEPS: usize, const PHRASES: usize, R: Rand, F: FileHandler> SystemHandler<BANKS, PADS, STEPS, PHRASES, R, F> {
+    pub fn new(step_div: u16, rand: R, fs: F) -> Self {
+        Self {
+            banks: core::array::from_fn(|_| BankHandler::new(step_div)),
+            rand,
+            fs,
+        }
+    }
+
+    pub fn read_all<T: core::ops::AddAssign + From<f32>>(
+        &mut self,
+        buffer: &mut [T],
+        channels: usize,
+        sample_rate: u16,
+    ) -> Result<(), Error<F::Error>> {
+        for bank in self.banks.iter_mut() {
+            bank.read_attenuated(&mut self.fs, buffer, channels, sample_rate)?;
+        }
+        Ok(())
+    }
+
+    pub fn tick(&mut self) -> Result<(), Error<F::Error>> {
+        for bank in self.banks.iter_mut() {
+            bank.tick(&mut self.rand, &mut self.fs)?;
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        for bank in self.banks.iter_mut() {
+            bank.stop();
+        }
+    }
+
+    pub fn assign_tempo(&mut self, tempo: f32) {
+        for bank in self.banks.iter_mut() {
+            bank.tempo = tempo;
+        }
     }
 }

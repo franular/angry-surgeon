@@ -35,9 +35,9 @@ pub enum BankCmd {
     LoadBank(Bank),
     Mangle,
     LoadKit(Option<u8>),
-    BakeRecord(Option<u8>, u16),
-    ClearPool,
-    PushPool(Option<u8>),
+    TrimRecord(Option<u8>, u16),
+    ClearSequence,
+    PushSequence(Option<u8>),
 }
 
 #[derive(Default)]
@@ -93,15 +93,15 @@ enum GlobalState {
 enum BankState {
     Mangle,
     LoadKit { index: Option<u8> },
-    BakeRecord { index: Option<u8>, len: u16 },
-    PushPool { index: Option<u8> },
+    TrimRecord { index: Option<u8>, len: u16 },
+    BuildSequence { index: Option<u8> },
 }
 
 struct BankHandler {
     kit_index: usize,
     bank: Bank,
     downs: heapless::Vec<u8, PAD_COUNT>,
-    pool: heapless::Deque<u8, MAX_PHRASE_COUNT>,
+    sequence: heapless::Deque<u8, MAX_PHRASE_COUNT>,
     state: BankState,
 }
 
@@ -111,7 +111,7 @@ impl BankHandler {
             kit_index: 0,
             bank: Bank::default(),
             downs: heapless::Vec::new(),
-            pool: heapless::Deque::new(),
+            sequence: heapless::Deque::new(),
             state: BankState::Mangle,
         }
     }
@@ -122,17 +122,17 @@ impl BankHandler {
             BankCmd::LoadBank(bank) => self.bank = bank,
             BankCmd::Mangle => self.mangle(),
             BankCmd::LoadKit(index) => self.load_kit(index),
-            BankCmd::BakeRecord(index, len) => self.state = BankState::BakeRecord { index, len },
-            BankCmd::PushPool(index) => self.push_pool(index),
-            BankCmd::ClearPool => self.pool.clear(),
+            BankCmd::TrimRecord(index, len) => self.state = BankState::TrimRecord { index, len },
+            BankCmd::PushSequence(index) => self.push_sequence(index),
+            BankCmd::ClearSequence => self.sequence.clear(),
         }
     }
 
     fn pad(&mut self, index: u8, down: bool) {
         if down {
             let _ = self.downs.push(index);
-            if let BankState::PushPool { .. } = &mut self.state {
-                let _ = self.pool.push_back(index);
+            if let BankState::BuildSequence { .. } = &mut self.state {
+                let _ = self.sequence.push_back(index);
             }
         } else {
             self.downs.retain(|v| *v != index);
@@ -140,7 +140,7 @@ impl BankHandler {
     }
 
     fn mangle(&mut self) {
-        if let BankState::BakeRecord {
+        if let BankState::TrimRecord {
             index: Some(index), ..
         } = self.state
         {
@@ -156,23 +156,23 @@ impl BankHandler {
         self.state = BankState::LoadKit { index };
     }
 
-    fn push_pool(&mut self, index: Option<u8>) {
+    fn push_sequence(&mut self, index: Option<u8>) {
         if let Some(index) = index {
             if self.bank.phrases[index as usize] {
-                let _ = self.pool.push_back(index);
+                let _ = self.sequence.push_back(index);
             }
         }
-        self.state = BankState::PushPool { index };
+        self.state = BankState::BuildSequence { index };
     }
 
     fn render(&self, flex: Flex, area: Rect, buf: &mut Buffer) {
         match self.state {
             BankState::Mangle => self.render_mangle(flex, area, buf),
             BankState::LoadKit { index } => self.render_load_kit(index, flex, area, buf),
-            BankState::BakeRecord { index, len } => {
+            BankState::TrimRecord { index, len } => {
                 self.render_bake_record(index, len, flex, area, buf)
             }
-            BankState::PushPool { index } => self.render_pool(index, area, buf),
+            BankState::BuildSequence { index } => self.render_sequence(index, area, buf),
         }
     }
 
@@ -266,8 +266,8 @@ impl BankHandler {
             .render(len_area, buf);
     }
 
-    fn render_pool(&self, index: Option<u8>, area: Rect, buf: &mut Buffer) {
-        let [pad_area, pool_area] =
+    fn render_sequence(&self, index: Option<u8>, area: Rect, buf: &mut Buffer) {
+        let [pad_area, seq_area] =
             Layout::horizontal(vec![Constraint::Min(8), Constraint::Percentage(100)]).areas(area);
         let [_, arrow_area] = Layout::horizontal(Constraint::from_maxes([7, 2]))
             .flex(Flex::Start)
@@ -275,7 +275,7 @@ impl BankHandler {
         // render border
         Block::bordered()
             .bold()
-            .title(" build pool ")
+            .title(" build sequence ")
             .render(area, buf);
         {
             // render pads
@@ -289,11 +289,11 @@ impl BankHandler {
                 .wrap(Wrap { trim: false })
                 .render(pad_area, buf);
         }
-        // render pool
-        Paragraph::new(Text::raw(format!("{:?}", self.pool)).left_aligned())
+        // render sequence
+        Paragraph::new(Text::raw(format!("{:?}", self.sequence)).left_aligned())
             .block(Block::new().padding(Padding::new(2, 2, 1, 0)))
             .wrap(Wrap { trim: false })
-            .render(pool_area, buf);
+            .render(seq_area, buf);
         // render arrow
         Paragraph::new(Text::raw(">>"))
             .block(Block::new().padding(Padding::new(0, 0, 1, 0)))

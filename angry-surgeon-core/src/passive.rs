@@ -1,7 +1,5 @@
 //! read-only data types
 
-use crate::{active, pads, Error, FileHandler};
-
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use micromath::F32Ext;
@@ -41,7 +39,7 @@ pub struct Onset {
     pub start: u64,
 }
 
-#[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     Sync,
     Hold { index: u8 },
@@ -55,18 +53,18 @@ pub(crate) struct Step {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Phrase<const STEPS: usize> {
+pub struct Phrase<const STEPS: usize> {
     #[serde(with = "serde_arrays")]
-    pub steps: [Step; STEPS],
-    pub len: u16,
+    pub(crate) steps: [Step; STEPS],
+    pub(crate) len: u16,
 }
 
 impl<const STEPS: usize> Phrase<STEPS> {
-    pub fn generate_step(&self, step_index: u16, phrase_drift: f32, rand: &mut impl Rand) -> Step {
+    pub(crate) fn generate_step(&self, step_index: u16, phrase_drift: f32, rand: &mut impl Rand) -> Step {
         let drift = phrase_drift * self.len as f32;
         let drift = rand.next_lim_usize(drift as usize + 1)
             + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;
-        let index = (step_index as usize + drift) % self.len as usize;
-        self.steps[STEPS - self.len as usize + index]
+        let index = STEPS - self.len as usize + (step_index as usize + drift) % self.len as usize;
+        self.steps[index]
     }
 }

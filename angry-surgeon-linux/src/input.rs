@@ -130,8 +130,8 @@ pub enum Cmd {
 enum BankState {
     Mangle,
     LoadKit,
-    BakeRecord,
-    BuildPool { cleared: bool },
+    TrimRecord,
+    BuildSequence { cleared: bool },
 }
 
 enum Preshift {
@@ -261,12 +261,12 @@ impl BankHandler {
         Ok(())
     }
 
-    fn speed(&mut self, value: u8, audio_tx: &mut Sender<audio::Cmd>) -> Result<()> {
+    fn pitch(&mut self, value: u8, audio_tx: &mut Sender<audio::Cmd>) -> Result<()> {
         if self.speed.maybe_set(value, self.shift) {
             let cmd = if self.shift {
                 audio_bank_cmd!(self.bank, AssignRoll, value as f32 / 127. * 8.)
             } else {
-                audio_bank_cmd!(self.bank, AssignSpeed, value as f32 / 127. * 2.)
+                audio_bank_cmd!(self.bank, AssignPitch, value as f32 / 127. * 2.)
             };
             audio_tx.send(cmd)?;
         }
@@ -293,9 +293,9 @@ impl BankHandler {
         match self.state {
             BankState::Mangle => {
                 self.reverse = false;
-                audio_tx.send(audio_bank_cmd!(self.bank, AssignReverse, false))?;
+                audio_tx.send(audio_bank_cmd!(self.bank, PushReverse, false))?;
             }
-            BankState::BakeRecord => {
+            BankState::TrimRecord => {
                 // exit record
                 self.state = BankState::Mangle;
                 audio_tx.send(audio_bank_cmd!(
@@ -318,25 +318,25 @@ impl BankHandler {
         if self.state == BankState::Mangle {
             if self.shift {
                 // init record
-                self.state = BankState::BakeRecord;
+                self.state = BankState::TrimRecord;
                 self.hold = false;
                 if self.downs.is_empty() {
                     audio_tx.send(audio_bank_cmd!(self.bank, PushEvent, Event::Sync))?;
                 }
                 audio_tx.send(audio_bank_cmd!(
                     self.bank,
-                    BakeRecord,
+                    TrimRecord,
                     MAX_PHRASE_LEN as u16
                 ))?;
                 tui_tx.send(tui_bank_cmd!(
                     self.bank,
-                    BakeRecord,
+                    TrimRecord,
                     None,
                     audio::MAX_PHRASE_LEN as u16
                 ))?;
             } else {
                 self.reverse = true;
-                audio_tx.send(audio_bank_cmd!(self.bank, AssignReverse, true))?;
+                audio_tx.send(audio_bank_cmd!(self.bank, PushReverse, true))?;
             }
         }
         Ok(())
@@ -347,11 +347,11 @@ impl BankHandler {
         audio_tx: &mut Sender<audio::Cmd>,
         tui_tx: &mut Sender<tui::Cmd>,
     ) -> Result<()> {
-        if let BankState::BuildPool { cleared } = self.state {
-            // exit build pool
+        if let BankState::BuildSequence { cleared } = self.state {
+            // exit build sequence
             if !cleared {
-                audio_tx.send(audio_bank_cmd!(self.bank, ClearPool))?;
-                tui_tx.send(tui_bank_cmd!(self.bank, ClearPool))?;
+                audio_tx.send(audio_bank_cmd!(self.bank, ClearSequence))?;
+                tui_tx.send(tui_bank_cmd!(self.bank, ClearSequence))?;
             }
             self.state = BankState::Mangle;
             tui_tx.send(tui_bank_cmd!(self.bank, Mangle))?;
@@ -366,9 +366,9 @@ impl BankHandler {
     ) -> Result<()> {
         if self.state == BankState::Mangle {
             if self.shift {
-                // init build pool
-                self.state = BankState::BuildPool { cleared: false };
-                tui_tx.send(tui_bank_cmd!(self.bank, PushPool, None))?;
+                // init build sequence
+                self.state = BankState::BuildSequence { cleared: false };
+                tui_tx.send(tui_bank_cmd!(self.bank, PushSequence, None))?;
             } else {
                 self.hold = !self.hold;
                 if !self.hold && self.downs.is_empty() {
@@ -426,16 +426,16 @@ impl BankHandler {
                     self.pad_input(audio_tx)?;
                 }
             }
-            BankState::BakeRecord => {
+            BankState::TrimRecord => {
                 let len = if self.downs.len() > 1 {
                     self.binary_offset(self.downs[0])
                 } else {
                     MAX_PHRASE_LEN as u16
                 };
-                audio_tx.send(audio_bank_cmd!(self.bank, BakeRecord, len))?;
+                audio_tx.send(audio_bank_cmd!(self.bank, TrimRecord, len))?;
                 tui_tx.send(tui_bank_cmd!(
                     self.bank,
-                    BakeRecord,
+                    TrimRecord,
                     self.downs.first().copied(),
                     len
                 ))?;
@@ -460,29 +460,29 @@ impl BankHandler {
                     self.downs.first().copied()
                 ))?;
             }
-            BankState::BakeRecord => {
+            BankState::TrimRecord => {
                 let len = if self.downs.len() > 1 {
                     self.binary_offset(self.downs[0])
                 } else {
                     MAX_PHRASE_LEN as u16
                 };
-                audio_tx.send(audio_bank_cmd!(self.bank, BakeRecord, len))?;
+                audio_tx.send(audio_bank_cmd!(self.bank, TrimRecord, len))?;
                 tui_tx.send(tui_bank_cmd!(
                     self.bank,
-                    BakeRecord,
+                    TrimRecord,
                     self.downs.first().copied(),
                     len
                 ))?;
             }
-            BankState::BuildPool { cleared } => {
+            BankState::BuildSequence { cleared } => {
                 if !*cleared {
                     *cleared = true;
-                    audio_tx.send(audio_bank_cmd!(self.bank, ClearPool))?;
-                    tui_tx.send(tui_bank_cmd!(self.bank, ClearPool))?;
+                    audio_tx.send(audio_bank_cmd!(self.bank, ClearSequence))?;
+                    tui_tx.send(tui_bank_cmd!(self.bank, ClearSequence))?;
                 }
                 audio_tx.send(audio_bank_cmd!(
                     self.bank,
-                    PushPool,
+                    PushSequence,
                     *self.downs.last().unwrap()
                 ))?;
             }
@@ -600,7 +600,7 @@ impl InputHandler {
                         MidiMessage::PitchBend { bend } => {
                             // affect both banks
                             self.audio_tx
-                                .send(audio::Cmd::OffsetSpeed(1. - bend.as_f32()))?;
+                                .send(audio::Cmd::OffsetPitch(1. - bend.as_f32()))?;
                         }
                         _ => (),
                     }
@@ -861,10 +861,10 @@ impl InputHandler {
                 self.bank_b.gain(value, &mut self.audio_tx)?;
             }
             ctrl::SPEED_A => {
-                self.bank_a.speed(value, &mut self.audio_tx)?;
+                self.bank_a.pitch(value, &mut self.audio_tx)?;
             }
             ctrl::SPEED_B => {
-                self.bank_b.speed(value, &mut self.audio_tx)?;
+                self.bank_b.pitch(value, &mut self.audio_tx)?;
             }
             ctrl::DRIFT_A => {
                 self.bank_a.drift(value, &mut self.audio_tx)?;
@@ -887,7 +887,7 @@ impl InputHandler {
                 self.audio_tx.send(audio::Cmd::AssignTempo(tempo))?;
             }
             self.last_step = Some(now);
-            self.audio_tx.send(audio::Cmd::Clock)?;
+            self.audio_tx.send(audio::Cmd::Tick)?;
             self.tui_tx.send(tui::Cmd::Clock)?;
         }
         self.clock = (self.clock + 1) % (PPQ / STEP_DIV);
@@ -899,8 +899,8 @@ impl InputHandler {
         self.clock = 0;
         self.last_step = None;
         self.audio_tx.send(audio::Cmd::Stop)?;
-        self.audio_tx.send(audio_bank_cmd!(Bank::A, ClearPool))?;
-        self.audio_tx.send(audio_bank_cmd!(Bank::B, ClearPool))?;
+        self.audio_tx.send(audio_bank_cmd!(Bank::A, ClearSequence))?;
+        self.audio_tx.send(audio_bank_cmd!(Bank::B, ClearSequence))?;
         self.tui_tx.send(tui::Cmd::Stop)?;
         Ok(())
     }

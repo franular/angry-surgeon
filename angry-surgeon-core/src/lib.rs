@@ -8,8 +8,8 @@ mod active;
 mod pads;
 mod passive;
 
-// pub use pads::{Bank, SystemHandler};
-// pub use passive::{Event, Onset, Phrase, Rd, Wav};
+pub use pads::{Bank, SystemHandler};
+pub use passive::{Event, Onset, Rd, Wav};
 
 pub const GRAIN_LEN: usize = 512;
 

@@ -24,21 +24,20 @@ pub enum Cmd {
     StopOneshot,
     AssignGainOneshot(f32),
 
-    Clock,
+    Tick,
     Stop,
     AssignTempo(f32),
-    OffsetSpeed(f32),
+    OffsetPitch(f32),
     Bank(Bank, BankCmd),
 }
 
 pub enum BankCmd {
     AssignGain(f32),
     AssignWidth(f32),
-    AssignSpeed(f32),
+    AssignPitch(f32),
     AssignRoll(f32),
     AssignKitDrift(f32),
     AssignPhraseDrift(f32),
-    AssignReverse(bool),
 
     SaveBank(std::fs::File),
     LoadBank(Box<angry_surgeon_core::Bank<PAD_COUNT, MAX_PHRASE_LEN>>),
@@ -47,10 +46,11 @@ pub enum BankCmd {
 
     ForceEvent(Event),
     PushEvent(Event),
+    PushReverse(bool),
+    TrimRecord(u16),
     TakeRecord(Option<u8>),
-    BakeRecord(u16),
-    ClearPool,
-    PushPool(u8),
+    ClearSequence,
+    PushSequence(u8),
 }
 
 pub struct Oneshot<const LEN: usize> {
@@ -158,8 +158,8 @@ pub struct SystemHandler {
         PAD_COUNT,
         MAX_PHRASE_LEN,
         MAX_PHRASE_COUNT,
-        crate::fs::LinuxFileHandler,
         tinyrand::Wyrand,
+        crate::fs::LinuxFileHandler,
     >,
     oneshot: Oneshot<{ angry_surgeon_core::GRAIN_LEN * 2 }>,
     cmd_rx: Receiver<Cmd>,
@@ -169,10 +169,9 @@ impl SystemHandler {
     pub fn new(cmd_rx: Receiver<Cmd>) -> Result<Self> {
         Ok(Self {
             system: angry_surgeon_core::SystemHandler::new(
-                crate::fs::LinuxFileHandler {},
-                tinyrand::Wyrand::seed(0xf2aa),
                 STEP_DIV,
-                8.,
+                tinyrand::Wyrand::seed(0xf2aa),
+                crate::fs::LinuxFileHandler {},
             ),
             oneshot: Oneshot::new(),
             cmd_rx,
@@ -189,12 +188,12 @@ impl SystemHandler {
                 Cmd::StopOneshot => self.oneshot.load(None)?,
                 Cmd::AssignGainOneshot(v) => self.oneshot.gain = v,
 
-                Cmd::Clock => self.system.tick()?,
+                Cmd::Tick => self.system.tick()?,
                 Cmd::Stop => self.system.stop(),
                 Cmd::AssignTempo(v) => self.system.assign_tempo(v),
-                Cmd::OffsetSpeed(v) => {
+                Cmd::OffsetPitch(v) => {
                     for bank in self.system.banks.iter_mut() {
-                        bank.speed.offset = v;
+                        bank.pitch.offset = v;
                     }
                 }
                 Cmd::Bank(bank, cmd) => {
@@ -202,43 +201,40 @@ impl SystemHandler {
                     match cmd {
                         BankCmd::AssignGain(v) => bank_h.gain = v,
                         BankCmd::AssignWidth(v) => bank_h.width = v,
-                        BankCmd::AssignSpeed(v) => bank_h.speed.base = v,
+                        BankCmd::AssignPitch(v) => bank_h.pitch.base = v,
                         BankCmd::AssignRoll(v) => bank_h.loop_div.base = v,
                         BankCmd::AssignKitDrift(v) => bank_h.kit_drift = v,
                         BankCmd::AssignPhraseDrift(v) => bank_h.phrase_drift = v,
-                        BankCmd::AssignReverse(v) => bank_h.assign_reverse(v),
 
                         BankCmd::SaveBank(mut file) => {
                             let json = serde_json::to_string_pretty(&bank_h.bank)?;
                             write!(file, "{}", json)?;
                         }
                         BankCmd::LoadBank(bank) => bank_h.bank = *bank,
-                        BankCmd::LoadKit(index) => bank_h.kit_index = index as usize,
+                        BankCmd::LoadKit(index) => bank_h.kit_index = index,
                         BankCmd::AssignOnset(index, onset) => bank_h.assign_onset(
                             index,
                             *onset,
                         ),
                         BankCmd::ForceEvent(event) => {
-                            bank_h.force_event(&mut self.system.fs, &mut self.system.rand, event)?
+                            bank_h.force_event(event, &mut self.system.rand, &mut self.system.fs)?
                         }
                         BankCmd::PushEvent(event) => {
-                            bank_h.push_event(&mut self.system.fs, &mut self.system.rand, event)?
+                            bank_h.push_event(event, &mut self.system.rand, &mut self.system.fs)?
                         }
+                        BankCmd::PushReverse(reverse) => bank_h.push_reverse(reverse),
+                        BankCmd::TrimRecord(len) => bank_h.trim_record(len),
                         BankCmd::TakeRecord(index) => bank_h.take_record(index),
-                        BankCmd::BakeRecord(len) => {
-                            bank_h.bake_record(&mut self.system.fs, &mut self.system.rand, len)?
-                        }
-                        BankCmd::ClearPool => bank_h.clear_pool(),
-                        BankCmd::PushPool(index) => bank_h.push_pool(index),
+                        BankCmd::ClearSequence => bank_h.clear_sequence(),
+                        BankCmd::PushSequence(index) => bank_h.push_sequence(index),
                     }
                 }
             }
         }
         buffer.fill(T::EQUILIBRIUM);
         let f32_buffer: &mut [f32] = unsafe { core::mem::transmute(buffer) };
-        self.system
-            .read_all::<SAMPLE_RATE, _>(f32_buffer, channels)?;
         self.oneshot.read_attenuated(f32_buffer, channels)?;
+        self.system.read_all(f32_buffer, channels, SAMPLE_RATE)?;
         Ok(())
     }
 }

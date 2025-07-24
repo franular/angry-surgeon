@@ -28,7 +28,7 @@ impl<F: FileHandler> Wav<F> {
     pub fn force_seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
         fs.seek(
             &mut self.file,
-            SeekFrom::Start(self.pcm_start - offset.rem_euclid(self.pcm_len as i64) as u64),
+            SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
         )
         .map(|_| ())
     }
@@ -70,11 +70,11 @@ pub(crate) enum Event<F: FileHandler> {
     Sync,
     Hold {
         onset: Onset<F>,
-        tick: u16,
+        tick: i16,
     },
     Loop {
         onset: Onset<F>,
-        tick: u16,
+        tick: i16,
         len: u16,
     },
 }
@@ -198,7 +198,6 @@ impl<F: FileHandler> Event<F> {
 /// active event and reverse
 pub(crate) struct Active<F: FileHandler> {
     pub event: Event<F>,
-    /// reverse start tick
     pub reverse: bool,
 }
 
@@ -280,6 +279,7 @@ impl<F: FileHandler> Input<F> {
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
+        self.active.reverse = self.buffer.reverse;
         if let Some(event) = self.buffer.event.take() {
             self.active
                 .event
@@ -292,18 +292,17 @@ impl<F: FileHandler> Input<F> {
     }
 }
 
-/// running phrase reading from **last** `step_count` steps of active
+/// running phrase reading from **last** passive::Phrase.len steps of source
+/// passive::Phrase
 pub(crate) struct Phrase<F: FileHandler> {
     /// step index sans drift
     pub step_index: u16,
-    /// phrase length
-    pub step_count: u16,
     pub active: Active<F>,
 }
 
 pub(crate) struct Record<const STEPS: usize, F: FileHandler> {
     /// running step queue
-    queue: heapless::Deque<passive::Step, STEPS>,
+    queue: heapless::HistoryBuffer<passive::Step, STEPS>,
     /// trimmed source phrase, if any
     pub source_phrase: Option<passive::Phrase<STEPS>>,
     /// active phrase, if any
@@ -313,7 +312,7 @@ pub(crate) struct Record<const STEPS: usize, F: FileHandler> {
 impl<const STEPS: usize, F: FileHandler> Default for Record<STEPS, F> {
     fn default() -> Self {
         Self {
-            queue: heapless::Deque::new(),
+            queue: heapless::HistoryBuffer::new(),
             source_phrase: None,
             active_phrase: None,
         }
@@ -337,7 +336,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
             if let Some(active_phrase) = self.active_phrase.as_mut() {
                 // increment step
                 active_phrase.step_index =
-                    (active_phrase.step_index + 1) % active_phrase.step_count;
+                    (active_phrase.step_index + 1) % source_phrase.len;
                 let step =
                     source_phrase.generate_step(active_phrase.step_index, phrase_drift, rand);
 
@@ -364,7 +363,6 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
                 };
                 self.active_phrase = Some(Phrase {
                     step_index: 0,
-                    step_count: source_phrase.len,
                     active: Active {
                         event,
                         reverse: step.reverse,
@@ -377,10 +375,24 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
     }
 
     pub fn push(&mut self, step: passive::Step) {
-        let _ = self.queue.push_back(step);
+        self.queue.write(step);
     }
 
-    pub fn save(&mut self) {
+    pub fn trim(&mut self, len: u16) {
+        if let Some(phrase) = self.source_phrase.as_mut() {
+            phrase.len = len;
+        } else {
+            self.save();
+        }
+        self.active_phrase = None;
+    }
+
+    pub fn take(&mut self) -> Option<passive::Phrase<STEPS>> {
+        self.active_phrase = None;
+        self.source_phrase.take()
+    }
+    
+    fn save(&mut self) {
         let mut steps = [passive::Step::default(); STEPS];
         let (front, back) = self.queue.as_slices();
         if !front.is_empty() {
@@ -394,19 +406,13 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
             len: self.queue.len() as u16,
         });
     }
-
-    pub fn trim(&mut self, len: u16) {
-        if let Some(phrase) = self.source_phrase.as_mut() {
-            phrase.len = len;
-        }
-    }
 }
 
 pub(crate) struct Sequence<const PHRASES: usize, F: FileHandler> {
     /// sequence index sans drift
     phrase_index: u16,
     /// sequence of source phrase indices
-    phrases: heapless::Vec<u8, PHRASES>,
+    phrases: heapless::HistoryBuffer<u8, PHRASES>,
     /// pad index of source phrase, if any
     source_phrase: Option<u8>,
     /// active phrase, if any
@@ -417,7 +423,7 @@ impl<const PHRASES: usize, F: FileHandler> Default for Sequence<PHRASES, F> {
     fn default() -> Self {
         Self {
             phrase_index: 0,
-            phrases: heapless::Vec::new(),
+            phrases: heapless::HistoryBuffer::new(),
             source_phrase: None,
             active_phrase: None,
         }
@@ -438,32 +444,12 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
         if let Some(active_phrase) = self.active_phrase.as_mut() {
-            let source_phrase = if let Some(source_phrase) = self
-                .source_phrase
-                .and_then(|v| bank.phrases[v as usize].as_ref())
-            {
-                if active_phrase.step_index >= active_phrase.step_count {
-                    if let Some(source_phrase) = Self::try_increment_phrase(
-                        &mut self.phrase_index,
-                        &self.phrases,
-                        &mut self.source_phrase,
-                        bank,
-                        phrase_drift,
-                        rand,
-                    ) {
-                        // incremented phrase
-                        active_phrase.step_count = source_phrase.len;
-                        active_phrase.step_index %= active_phrase.step_count;
-                        source_phrase
-                    } else {
-                        self.active_phrase = None;
-                        return Ok(None);
-                    }
-                } else {
-                    // increment step
-                    active_phrase.step_index += 1;
-                    source_phrase
-                }
+            let source_phrase = self.source_phrase.and_then(|v| bank.phrases[v as usize].as_ref());
+
+            let source_phrase = if source_phrase.is_some_and(|v| active_phrase.step_index < v.len) {
+                // increment step
+                active_phrase.step_index += 1;
+                source_phrase.unwrap()
             } else if let Some(source_phrase) = Self::try_increment_phrase(
                 &mut self.phrase_index,
                 &self.phrases,
@@ -473,8 +459,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                 rand,
             ) {
                 // incremented phrase
-                active_phrase.step_count = source_phrase.len;
-                active_phrase.step_index %= active_phrase.step_count;
+                active_phrase.step_index %= source_phrase.len;
                 source_phrase
             } else {
                 self.active_phrase = None;
@@ -511,7 +496,6 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
             };
             self.active_phrase = Some(Phrase {
                 step_index: 0,
-                step_count: source_phrase.len,
                 active: Active {
                     event,
                     reverse: step.reverse,
@@ -524,10 +508,20 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
         Ok(None)
     }
 
+    pub fn clear(&mut self) {
+        self.phrase_index = 0;
+        self.phrases.clear();
+        self.source_phrase = None;
+    }
+
+    pub fn push(&mut self, index: u8) {
+        self.phrases.write(index);
+    }
+
     /// associated method to appease borrow rules
     fn try_increment_phrase<'d, const PADS: usize, const STEPS: usize>(
         phrase_index: &mut u16,
-        phrases: &heapless::Vec<u8, PHRASES>,
+        phrases: &heapless::HistoryBuffer<u8, PHRASES>,
         source_phrase: &mut Option<u8>,
         bank: &'d pads::Bank<PADS, STEPS>,
         phrase_drift: f32,
@@ -535,7 +529,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
     ) -> Option<&'d passive::Phrase<STEPS>> {
         // try increment phrase
         let phrase_count = phrases
-            .iter()
+            .oldest_ordered()
             .filter(|v| bank.phrases[**v as usize].is_some())
             .count();
         if phrase_count != 0 {
@@ -546,7 +540,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                     + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;
                 let index = (*phrase_index as usize + drift) % phrase_count;
                 phrases
-                    .iter()
+                    .oldest_ordered()
                     .cycle()
                     .filter(|v| bank.phrases[**v as usize].is_some())
                     .nth(index)
