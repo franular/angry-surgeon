@@ -82,7 +82,7 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
             .windows(2)
             .enumerate()
             .rev()
-            .find(|(_, w)| Self::is_zero_xing(w[0], w[1]))
+            .find(|(i, w)| Self::is_zero_xing(w[0], w[1]) && *i != start)
             .map(|(i, _)| i)
             .unwrap_or(MAX_LEN - 1);
         self.bounds = start..end;
