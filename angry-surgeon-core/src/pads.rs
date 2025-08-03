@@ -1,6 +1,6 @@
 //! main logic-to-audio driver
 
-use crate::{active, passive, Error, FileHandler};
+use crate::{active, passive, Error, FileHandler, GRAIN_LEN};
 use embedded_io::ReadExactError;
 use tinyrand::Rand;
 
@@ -37,57 +37,49 @@ macro_rules! actives {
     };
 }
 
-struct GrainReader<const MAX_LEN: usize> {
-    /// sample buffer
-    samples: [i16; MAX_LEN],
-    /// i16 sample index
+struct GrainReader {
+    hann: [f32; GRAIN_LEN / 2 + 1],
+    buffers: [[i16; GRAIN_LEN + 1]; 2],
+    fresh: bool,
     index: f32,
-    bounds: core::ops::Range<usize>,
 }
 
-impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
+impl GrainReader {
     fn new() -> Self {
+        let hann = core::array::from_fn(|i| {
+            0.5 - 0.5 * f32::cos(2. * core::f32::consts::PI * i as f32 / GRAIN_LEN as f32)
+        });
         Self {
-            samples: [0; MAX_LEN],
+            hann,
+            buffers: [[0; GRAIN_LEN + 1]; 2],
+            fresh: false,
             index: 0.,
-            bounds: 0..0,
         }
     }
 
-    fn is_zero_xing(sample_a: i16, sample_b: i16) -> bool {
-        sample_a.signum() != sample_b.signum()
+    fn fill<F: FileHandler>(&mut self, wav: &mut active::Wav<F>, fs: &mut F) -> Result<u64, F::Error> {
+        let init_pos = wav.pos(fs)?;
+        self.fresh = !self.fresh;
+        let bytes = bytemuck::cast_slice_mut(&mut self.buffers[self.fresh as usize][..]);
+        wav.read(bytes, fs)?;
+        self.index = self.index.rem_euclid((GRAIN_LEN / 2) as f32);
+        Ok(init_pos)
     }
 
-    // refill buffer; return pre-read position
-    fn fill<F: FileHandler>(
-        &mut self,
-        wav: &mut active::Wav<F>,
-        fs: &mut F,
-    ) -> Result<u64, F::Error> {
-        wav.flush_seek(fs)?;
-        let init_pos = wav.pos(fs)?;
-
-        let bytes = bytemuck::cast_slice_mut(&mut self.samples[..]);
-        wav.read(bytes, fs)?;
-        // find zero xings about new grain
-        let start = self
-            .samples
-            .windows(2)
-            .enumerate()
-            .find(|(_, w)| Self::is_zero_xing(w[0], w[1]))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let end = self
-            .samples
-            .windows(2)
-            .enumerate()
-            .rev()
-            .find(|(i, w)| Self::is_zero_xing(w[0], w[1]) && *i != start)
-            .map(|(i, _)| i)
-            .unwrap_or(MAX_LEN - 1);
-        self.bounds = start..end;
-
-        Ok(init_pos)
+    fn sample(&self, reverse: bool, index: usize) -> f32 {
+        if reverse {
+            let (stale, fresh) = (
+                self.buffers[!self.fresh as usize][index] as f32 / i16::MAX as f32,
+                self.buffers[self.fresh as usize][index + GRAIN_LEN / 2] as f32 / i16::MAX as f32,
+            );
+            stale * self.hann[index] + fresh * self.hann[GRAIN_LEN / 2 - index]
+        } else {
+            let (stale, fresh) = (
+                self.buffers[!self.fresh as usize][index + GRAIN_LEN / 2] as f32 / i16::MAX as f32,
+                self.buffers[self.fresh as usize][index] as f32 / i16::MAX as f32,
+            );
+            stale * self.hann[GRAIN_LEN / 2 - index] + fresh * self.hann[index]
+        }
     }
 
     fn read_interpolated<F: FileHandler>(
@@ -98,35 +90,27 @@ impl<const MAX_LEN: usize> GrainReader<MAX_LEN> {
         wav: &mut active::Wav<F>,
         fs: &mut F,
     ) -> Result<f32, F::Error> {
-        let init_bounds = self.bounds.clone();
-
-        if self.bounds.is_empty() || self.index as i64 >= self.bounds.end as i64 {
+        if self.index as i64 >= GRAIN_LEN as i64 / 2 {
             let init_pos = self.fill(wav, fs)?;
-            wav.force_seek(
-                init_pos as i64 + (self.bounds.len() as f32 * stretch) as i64 * 2,
+            wav.seek(
+                init_pos as i64 + ((GRAIN_LEN / 2) as f32 * stretch) as i64 * 2,
                 fs,
             )?;
-            self.index = self.index - init_bounds.end as f32 + self.bounds.start as f32;
-        } else if (self.index as i64) < self.bounds.start as i64 {
+        } else if (self.index as i64) < 0 {
             let init_pos = self.fill(wav, fs)?;
-            wav.force_seek(
-                init_pos as i64 - (self.bounds.len() as f32 * stretch) as i64 * 2,
+            wav.seek(
+                init_pos as i64 - ((GRAIN_LEN / 2) as f32 * stretch) as i64 * 2,
                 fs,
             )?;
-            self.index = self.index - init_bounds.start as f32 + self.bounds.end as f32;
         }
-        // read sample with linear interpolation
-        let word_a =
-            self.samples[self.index as usize] as f32 / i16::MAX as f32 * (1. - self.index.fract());
-        let word_b =
-            self.samples[self.index as usize + 1] as f32 / i16::MAX as f32 * self.index.fract();
-
+        // linear interpolation
+        let word_a = self.sample(reverse, self.index as usize) * (1. - self.index.fract());
+        let word_b = self.sample(reverse, self.index as usize + 1) * (self.index.fract());
         if reverse {
             self.index -= pitch;
         } else {
             self.index += pitch;
         }
-
         Ok(word_a + word_b)
     }
 }
@@ -173,7 +157,7 @@ impl<const PADS: usize> Kit<PADS> {
     ) -> Result<Option<active::Onset<F>>, Error<F::Error>> {
         if let Some(source) = self.onsets[index as usize].as_ref() {
             let mut onset = Self::onset_inner(source, to_close, index, pan, fs)?;
-            onset.wav.force_seek(source.start as i64 * 2, fs)?;
+            onset.wav.seek(source.start as i64 * 2, fs)?;
             Ok(Some(onset))
         } else {
             Ok(None)
@@ -233,7 +217,6 @@ impl<const PADS: usize> Kit<PADS> {
             file,
             pcm_start,
             pcm_len,
-            seek_to: None,
         };
         Ok(active::Onset {
             index,
@@ -322,7 +305,7 @@ pub struct BankHandler<const PADS: usize, const STEPS: usize, const PHRASES: usi
     input: active::Input<F>,
     record: active::Record<STEPS, F>,
     sequence: active::Sequence<PHRASES, F>,
-    reader: GrainReader<{ crate::GRAIN_LEN }>,
+    reader: GrainReader,
 }
 
 impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler>
@@ -467,9 +450,9 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                 if pos > end || pos < start && pos + wav.pcm_len > end {
                     // always loop over len/loop_div steps **after** onset
                     if reverse {
-                        wav.push_seek(end as i64);
+                        wav.seek(end as i64, fs)?;
                     } else {
-                        wav.push_seek(start as i64);
+                        wav.seek(start as i64, fs)?;
                     }
                 }
             }
@@ -501,7 +484,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         pitch: f32,
         reverse: bool,
         onset: &mut active::Onset<F>,
-        reader: &mut GrainReader<{ crate::GRAIN_LEN }>,
+        reader: &mut GrainReader,
         fs: &mut F,
         buffer: &mut [T],
         channels: usize,
@@ -566,7 +549,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                     let wav = &mut onset.wav;
                     if let Some(steps) = wav.steps {
                         let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
-                        wav.push_seek(onset.start as i64 * 2 + offset);
+                        wav.seek(onset.start as i64 * 2 + offset, fs)?;
                     }
                 }
                 active::Event::Loop { onset, tick, len } => {
@@ -576,7 +559,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
                             * (*tick as f32).rem_euclid(*len as f32 / self.loop_div.net()))
                             as i64
                             & !1;
-                        wav.push_seek(onset.start as i64 * 2 + offset);
+                        wav.seek(onset.start as i64 * 2 + offset, fs)?;
                     }
                 }
             }

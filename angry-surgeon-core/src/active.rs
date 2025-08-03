@@ -17,7 +17,6 @@ pub(crate) struct Wav<F: FileHandler> {
     pub file: F::File,
     pub pcm_start: u64,
     pub pcm_len: u64,
-    pub seek_to: Option<i64>,
 }
 
 impl<F: FileHandler> Wav<F> {
@@ -25,32 +24,18 @@ impl<F: FileHandler> Wav<F> {
         Ok(fs.stream_position(&mut self.file)? - self.pcm_start)
     }
 
-    pub fn force_seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
-        fs.seek(
-            &mut self.file,
-            SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
-        )
-        .map(|_| ())
+    pub fn seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
+        fs.seek(&mut self.file, SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64)).map(|_| ())
     }
 
-    pub fn push_seek(&mut self, offset: i64) {
-        self.seek_to = Some(offset);
-    }
-
-    pub fn flush_seek(&mut self, fs: &mut F) -> Result<(), F::Error> {
-        if let Some(offset) = self.seek_to.take() {
-            self.force_seek(offset, fs)?;
-        }
-        Ok(())
-    }
-
+    /// looping read
     pub fn read(&mut self, bytes: &mut [u8], fs: &mut F) -> Result<(), F::Error> {
         let mut slice = bytes;
         while !slice.is_empty() {
             let len = slice.len().min((self.pcm_len - self.pos(fs)?) as usize);
             let n = fs.read(&mut self.file, &mut slice[..len])?;
             if n == 0 {
-                self.force_seek(0, fs)?;
+                self.seek(0, fs)?;
             }
             slice = &mut slice[n..];
         }
@@ -219,9 +204,9 @@ impl<F: FileHandler> Active<F> {
         }
     }
 
-    /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`, push seek to sync to
-    /// tick offset from onset
-    pub fn tick(&mut self, xor_reverse: bool, loop_div: f32) {
+    /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`, seek to sync to tick
+    /// offset from onset
+    pub fn tick(&mut self, xor_reverse: bool, loop_div: f32, fs: &mut F) -> Result<(), Error<F::Error>> {
         match &mut self.event {
             Event::Sync => (),
             Event::Hold { onset, tick } => {
@@ -233,7 +218,7 @@ impl<F: FileHandler> Active<F> {
                 let wav = &mut onset.wav;
                 if let Some(steps) = wav.steps {
                     let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
-                    wav.push_seek(onset.start as i64 * 2 + offset);
+                    wav.seek(onset.start as i64 * 2 + offset, fs)?;
                 }
             }
             Event::Loop { onset, tick, len } => {
@@ -248,10 +233,11 @@ impl<F: FileHandler> Active<F> {
                         * (*tick as f32).rem_euclid(*len as f32 / loop_div))
                         as i64
                         & !1;
-                    wav.push_seek(onset.start as i64 * 2 + offset);
+                    wav.seek(onset.start as i64 * 2 + offset, fs)?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -286,7 +272,7 @@ impl<F: FileHandler> Input<F> {
                 .trans(&event, bank, kit_index, kit_drift, rand, fs)?;
             return Ok(Some(event));
         } else {
-            self.active.tick(false, loop_div);
+            self.active.tick(false, loop_div, fs)?;
         }
         Ok(None)
     }
@@ -349,7 +335,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
                         .trans(event, bank, kit_index, kit_drift, rand, fs)?;
                     return Ok(Some(*event));
                 } else {
-                    active_phrase.active.tick(xor_reverse, loop_div);
+                    active_phrase.active.tick(xor_reverse, loop_div, fs)?;
                 }
             } else {
                 // start active phrase from empty
@@ -475,7 +461,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                     .trans(event, bank, kit_index, kit_drift, rand, fs)?;
                 return Ok(Some(*event));
             } else {
-                active_phrase.active.tick(xor_reverse, loop_div);
+                active_phrase.active.tick(xor_reverse, loop_div, fs)?;
             }
         } else if let Some(source_phrase) = Self::try_increment_phrase(
             &mut self.phrase_index,
