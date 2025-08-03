@@ -62,24 +62,15 @@ impl GrainReader {
         self.fresh = !self.fresh;
         let bytes = bytemuck::cast_slice_mut(&mut self.buffers[self.fresh as usize][..]);
         wav.read(bytes, fs)?;
-        self.index = self.index.rem_euclid((GRAIN_LEN / 2) as f32);
         Ok(init_pos)
     }
 
-    fn sample(&self, reverse: bool, index: usize) -> f32 {
-        if reverse {
-            let (stale, fresh) = (
-                self.buffers[!self.fresh as usize][index] as f32 / i16::MAX as f32,
-                self.buffers[self.fresh as usize][index + GRAIN_LEN / 2] as f32 / i16::MAX as f32,
-            );
-            stale * self.hann[index] + fresh * self.hann[GRAIN_LEN / 2 - index]
-        } else {
-            let (stale, fresh) = (
-                self.buffers[!self.fresh as usize][index + GRAIN_LEN / 2] as f32 / i16::MAX as f32,
-                self.buffers[self.fresh as usize][index] as f32 / i16::MAX as f32,
-            );
-            stale * self.hann[GRAIN_LEN / 2 - index] + fresh * self.hann[index]
-        }
+    fn sample(&self, index: isize) -> f32 {
+        let (stale, fresh) = (
+            self.buffers[!self.fresh as usize][((index + GRAIN_LEN as isize / 2).rem_euclid(GRAIN_LEN as isize)) as usize] as f32 / i16::MAX as f32,
+            self.buffers[self.fresh as usize][index.rem_euclid(GRAIN_LEN as isize) as usize] as f32 / i16::MAX as f32,
+        );
+        stale * self.hann[GRAIN_LEN / 2 - index.unsigned_abs()] + fresh * self.hann[index.unsigned_abs()]
     }
 
     fn read_interpolated<F: FileHandler>(
@@ -96,16 +87,20 @@ impl GrainReader {
                 init_pos as i64 + ((GRAIN_LEN / 2) as f32 * stretch) as i64 * 2,
                 fs,
             )?;
-        } else if (self.index as i64) < 0 {
+            // wrap to 0..GRAIN_LEN
+            self.index %= (GRAIN_LEN / 2) as f32;
+        } else if self.index as i64 <= -(GRAIN_LEN as i64) / 2 {
             let init_pos = self.fill(wav, fs)?;
             wav.seek(
                 init_pos as i64 - ((GRAIN_LEN / 2) as f32 * stretch) as i64 * 2,
                 fs,
             )?;
+            // wrap to 0..-GRAIN_LEN
+            self.index = -(self.index.abs() % (GRAIN_LEN / 2) as f32);
         }
         // linear interpolation
-        let word_a = self.sample(reverse, self.index as usize) * (1. - self.index.fract());
-        let word_b = self.sample(reverse, self.index as usize + 1) * (self.index.fract());
+        let word_a = self.sample(self.index as isize) * (1. - self.index.fract());
+        let word_b = self.sample(self.index as isize + 1) * (self.index.fract());
         if reverse {
             self.index -= pitch;
         } else {
