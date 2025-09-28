@@ -7,7 +7,7 @@ use tinyrand::Rand;
 
 extern crate alloc;
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Rd {
     pub tempo: Option<f32>,
     pub steps: Option<u16>,
