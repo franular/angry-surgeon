@@ -9,7 +9,6 @@ extern crate alloc;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Rd {
-    pub tempo: Option<f32>,
     pub steps: Option<u16>,
     pub onsets: alloc::vec::Vec<u64>,
 }
@@ -17,7 +16,6 @@ pub struct Rd {
 impl Default for Rd {
     fn default() -> Self {
         Self {
-            tempo: None,
             steps: None,
             onsets: alloc::vec![0],
         }
@@ -26,11 +24,8 @@ impl Default for Rd {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Wav {
-    pub tempo: Option<f32>,
     pub steps: Option<u16>,
     pub path: alloc::string::String,
-    /// pcm length in bytes
-    pub len: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

@@ -12,11 +12,11 @@ use micromath::F32Ext;
 
 #[derive(Clone)]
 pub(crate) struct Wav<F: FileHandler> {
-    pub tempo: Option<f32>,
     pub steps: Option<u16>,
     pub file: F::File,
     pub pcm_start: u64,
     pub pcm_len: u64,
+    pub sample_rate: u32,
 }
 
 impl<F: FileHandler> Wav<F> {
@@ -28,16 +28,15 @@ impl<F: FileHandler> Wav<F> {
         fs.seek(&mut self.file, SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64)).map(|_| ())
     }
 
-    /// looping read
-    pub fn read(&mut self, bytes: &mut [u8], fs: &mut F) -> Result<(), F::Error> {
-        let mut slice = bytes;
-        while !slice.is_empty() {
-            let len = slice.len().min((self.pcm_len - self.pos(fs)?) as usize);
-            let n = fs.read(&mut self.file, &mut slice[..len])?;
+    // read that loops without crossfade as fallback
+    pub fn read(&mut self, mut bytes: &mut [u8], fs: &mut F) -> Result<(), F::Error> {
+        while !bytes.is_empty() {
+            let len = bytes.len().min((self.pcm_len - self.pos(fs)?) as usize);
+            let n = fs.read(&mut self.file, &mut bytes[..len])?;
             if n == 0 {
                 self.seek(0, fs)?;
             }
-            slice = &mut slice[n..];
+            bytes = &mut bytes[n..];
         }
         Ok(())
     }

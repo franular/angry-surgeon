@@ -774,14 +774,12 @@ impl InputHandler {
                     GlobalState::LoadOnset { rd, onset_index } => {
                         let cx = self.rd_cx.as_ref().unwrap();
                         let path = &cx.paths[cx.file_index];
-                        if let Ok(meta) = std::fs::metadata(path) {
+                        if std::fs::exists(path)? {
                             // assign onset to pad
                             let onset = Onset {
                                 wav: Wav {
-                                    tempo: rd.tempo,
                                     steps: rd.steps,
                                     path: path.to_str().unwrap().to_string(),
-                                    len: meta.len() - 44,
                                 },
                                 start: rd.onsets[*onset_index],
                             };
@@ -813,14 +811,12 @@ impl InputHandler {
                     GlobalState::LoadOnset { rd, onset_index } => {
                         let cx = self.rd_cx.as_ref().unwrap();
                         let path = &cx.paths[cx.file_index].with_extension("wav");
-                        if let Ok(meta) = std::fs::metadata(path) {
+                        if std::fs::exists(path)? {
                             // assign onset to pad
                             let onset = Onset {
                                 wav: Wav {
-                                    tempo: rd.tempo,
                                     steps: rd.steps,
                                     path: path.to_str().unwrap().to_string(),
-                                    len: meta.len() - 44,
                                 },
                                 start: rd.onsets[*onset_index],
                             };

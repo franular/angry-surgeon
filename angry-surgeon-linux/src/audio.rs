@@ -4,7 +4,7 @@ use cpal::{FromSample, SizedSample};
 use std::{io::{Read, Seek, Write}, sync::mpsc::Receiver};
 use tinyrand::Seeded;
 
-pub const SAMPLE_RATE: u16 = 48000;
+pub const SAMPLE_RATE: u32 = 48000;
 pub const PPQ: u16 = 24;
 pub const LINES_PER_STEP: u16 = 4;
 
@@ -59,6 +59,7 @@ pub struct Oneshot<const LEN: usize> {
     bytes: [u8; LEN],
     index: usize,
     rem: u64,
+    sample_rate: u32,
     gain: f32,
 }
 
@@ -69,14 +70,22 @@ impl<const LEN: usize> Oneshot<LEN> {
             bytes: [0; LEN],
             index: 0,
             rem: 0,
+            sample_rate: 0,
             gain: 1.,
         }
     }
 
     fn load(&mut self, mut file: Option<std::fs::File>) -> Result<()> {
         if let Some(file) = file.as_mut() {
-            // parse wav looking for `data` subchunk
-            self.rem = loop {
+            let assert = |b: bool| if !b {
+                Err(color_eyre::Report::msg("bad .wav"))
+            } else {
+                Ok(())
+            };
+            // parse wav looking for metadata and `data` subchunk
+            let mut pcm_start = 0;
+            let mut essential_chunks_parsed = 0;
+            while essential_chunks_parsed < 3 {
                 let mut id = [0u8; 4];
                 file.read_exact(&mut id)?;
                 if &id[..] == b"RIFF" {
@@ -84,14 +93,31 @@ impl<const LEN: usize> Oneshot<LEN> {
                     let mut data = [0u8; 4];
                     file.read_exact(&mut data)?;
                     if &data[..] != b"WAVE" {
-                        return Err(color_eyre::Report::msg("bad format"));
+                        return Err(color_eyre::Report::msg("bad .wav"));
                     }
+                    essential_chunks_parsed += 1;
+                } else if &id[..] == b"fmt " {
+                    let mut data32 = [0u8; 4];
+                    let mut data16 = [0u8; 2];
+                    file.read_exact(&mut data32)?;
+                    assert(u32::from_le_bytes(data32) == 16)?; // `fmt ` chunk size
+                    file.read_exact(&mut data16)?;
+                    assert(u16::from_le_bytes(data16) == 1)?; // pcm integer format
+                    file.read_exact(&mut data16)?;
+                    assert(u16::from_le_bytes(data16) == 1)?; // 1 channel
+                    file.read_exact(&mut data32)?;
+                    self.sample_rate = u32::from_le_bytes(data32);
+                    file.seek_relative(6)?;
+                    file.read_exact(&mut data16)?;
+                    assert(u16::from_le_bytes(data16) == 16)?; // 16 bits/sample
+                    essential_chunks_parsed += 1;
                 } else if &id[..] == b"data" {
                     let mut size = [0u8; 4];
                     file.read_exact(&mut size)?;
-                    let pcm_start = file.stream_position()?;
+                    pcm_start = file.stream_position()?;
                     let pcm_len = u32::from_le_bytes(size) as u64;
-                    break pcm_start + pcm_len;
+                    self.rem = pcm_start + pcm_len;
+                    essential_chunks_parsed += 1;
                 } else {
                     let mut size = [0u8; 4];
                     file.read_exact(&mut size)?;
@@ -99,6 +125,7 @@ impl<const LEN: usize> Oneshot<LEN> {
                     file.seek_relative(chunk_len)?;
                 }
             };
+            file.seek(std::io::SeekFrom::Start(pcm_start))?;
         }
         self.file = file;
         Ok(())
@@ -234,7 +261,7 @@ impl SystemHandler {
         buffer.fill(T::EQUILIBRIUM);
         let f32_buffer: &mut [f32] = unsafe { core::mem::transmute(buffer) };
         self.oneshot.read_attenuated(f32_buffer, channels)?;
-        self.system.read_all(f32_buffer, channels)?;
+        self.system.read_all(f32_buffer, channels, SAMPLE_RATE)?;
         Ok(())
     }
 }

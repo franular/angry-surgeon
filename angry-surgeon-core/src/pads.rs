@@ -44,8 +44,8 @@ const FADE_LEN: usize = 64;
 
 pub(crate) struct GrainReader {
     buffer: [i16; GRAIN_LEN + 1], // +1 frame for interpolation
-    fade_head: Option<[i16; FADE_LEN]>,
     fade_tail: Option<[i16; FADE_LEN]>,
+    fade_head: Option<[i16; FADE_LEN]>,
     index: f32,
 }
 
@@ -53,31 +53,42 @@ impl GrainReader {
     fn new() -> Self {
         Self {
             buffer: [0; GRAIN_LEN + 1],
-            fade_head: None,
             fade_tail: None,
+            fade_head: None,
             index: 0.,
         }
     }
 
     pub fn fade<F: FileHandler>(&mut self, wav: Option<&mut active::Wav<F>>, fs: &mut F) -> Result<(), F::Error> {
-        let fade_tail = self.fade_tail.get_or_insert([0; FADE_LEN]);
-        let fade_head = self.fade_head.get_or_insert([0; FADE_LEN]);
+        Self::fade_inner(&mut self.fade_tail, &mut self.fade_head, wav, fs)
+    }
+
+    fn fade_inner<F: FileHandler>(fade_tail: &mut Option<[i16; FADE_LEN]>, fade_head: &mut Option<[i16; FADE_LEN]>, wav: Option<&mut active::Wav<F>>, fs: &mut F) -> Result<(), F::Error> {
         if let Some(wav) = wav {
             let end_pos = wav.pos(fs)?;
-            let bytes = bytemuck::cast_slice_mut(fade_tail);
+            let bytes = bytemuck::cast_slice_mut(fade_tail.get_or_insert([0; FADE_LEN]));
             wav.read(bytes, fs)?;
-            let bytes = bytemuck::cast_slice_mut(fade_head);
             wav.seek(end_pos as i64 - (GRAIN_LEN + FADE_LEN) as i64, fs)?;
+            let bytes = bytemuck::cast_slice_mut(fade_head.get_or_insert([0; FADE_LEN]));
             wav.read(bytes, fs)?;
         }
         Ok(())
     }
 
+    /// looping read with crossfade at eof
     fn fill<F: FileHandler>(&mut self, wav: &mut active::Wav<F>, fs: &mut F) -> Result<u64, F::Error> {
-        // prepare next crossfade
         let init_pos = wav.pos(fs)?;
-        let bytes = bytemuck::cast_slice_mut(&mut self.buffer[..]);
-        wav.read(bytes, fs)?;
+        let mut slice = bytemuck::cast_slice_mut(&mut self.buffer[..]);
+        while !slice.is_empty() {
+            let len = slice.len().min((wav.pcm_len - wav.pos(fs)?) as usize);
+            let n = fs.read(&mut wav.file, &mut slice[..len])?;
+            if n == 0 {
+                // rewind to start/end with crossfade
+                Self::fade_inner(&mut self.fade_tail, &mut self.fade_head, Some(wav), fs)?;
+                wav.seek(0, fs)?;
+            }
+            slice = &mut slice[n..];
+        }
         Ok(init_pos)
     }
 
@@ -204,48 +215,63 @@ impl<const PADS: usize> Kit<PADS> {
             fs.close(file)?;
         }
         let mut file = fs.open(&source.wav.path)?;
-        // parse wav looking for `data` subchunk
-        let (pcm_start, pcm_len) = loop {
+        let re_err = |e| match e {
+            ReadExactError::UnexpectedEof => Error::DataNotFound,
+            ReadExactError::Other(e) => Error::Other(e),
+        };
+        let assert = |b: bool| if !b {
+            Err(Error::BadFormat)
+        } else {
+            Ok(())
+        };
+        // parse wav looking for metadata and `data` subchunk
+        let mut pcm_start = 0;
+        let mut pcm_len = 0;
+        let mut sample_rate = 0;
+        let mut essential_chunks_parsed = 0;
+        while essential_chunks_parsed < 3 {
             let mut id = [0u8; 4];
-            fs.read_exact(&mut file, &mut id).map_err(|e| match e {
-                ReadExactError::UnexpectedEof => Error::DataNotFound,
-                ReadExactError::Other(e) => Error::Other(e),
-            })?;
+            fs.read_exact(&mut file, &mut id).map_err(re_err)?;
             if &id[..] == b"RIFF" {
                 fs.seek(&mut file, embedded_io::SeekFrom::Current(4))?;
                 let mut data = [0u8; 4];
-                fs.read_exact(&mut file, &mut data).map_err(|e| match e {
-                    ReadExactError::UnexpectedEof => Error::DataNotFound,
-                    ReadExactError::Other(e) => Error::Other(e),
-                })?;
-                if &data[..] != b"WAVE" {
-                    return Err(Error::BadFormat);
-                }
+                fs.read_exact(&mut file, &mut data).map_err(re_err)?;
+                assert(&data[..] == b"WAVE")?;
+                essential_chunks_parsed += 1;
+            } else if &id[..] == b"fmt " {
+                let mut data32 = [0u8; 4];
+                let mut data16 = [0u8; 2];
+                fs.read_exact(&mut file, &mut data32).map_err(re_err)?;
+                assert(u32::from_le_bytes(data32) == 16)?; // `fmt ` chunk size
+                fs.read_exact(&mut file, &mut data16).map_err(re_err)?;
+                assert(u16::from_le_bytes(data16) == 1)?; // pcm integer format
+                fs.read_exact(&mut file, &mut data16).map_err(re_err)?;
+                assert(u16::from_le_bytes(data16) == 1)?; // 1 channel
+                fs.read_exact(&mut file, &mut data32).map_err(re_err)?;
+                sample_rate = u32::from_le_bytes(data32);
+                fs.seek(&mut file, embedded_io::SeekFrom::Current(6))?;
+                fs.read_exact(&mut file, &mut data16).map_err(re_err)?;
+                assert(u16::from_le_bytes(data16) == 16)?; // 16 bits/sample
+                essential_chunks_parsed += 1;
             } else if &id[..] == b"data" {
                 let mut size = [0u8; 4];
-                fs.read_exact(&mut file, &mut size).map_err(|e| match e {
-                    ReadExactError::UnexpectedEof => Error::DataNotFound,
-                    ReadExactError::Other(e) => Error::Other(e),
-                })?;
-                let pcm_start = fs.stream_position(&mut file)?;
-                let pcm_len = u32::from_le_bytes(size) as u64;
-                break (pcm_start, pcm_len);
+                fs.read_exact(&mut file, &mut size).map_err(re_err)?;
+                pcm_start = fs.stream_position(&mut file)?;
+                pcm_len = u32::from_le_bytes(size) as u64;
+                essential_chunks_parsed += 1;
             } else {
                 let mut size = [0u8; 4];
-                fs.read_exact(&mut file, &mut size).map_err(|e| match e {
-                    ReadExactError::UnexpectedEof => Error::DataNotFound,
-                    ReadExactError::Other(e) => Error::Other(e),
-                })?;
+                fs.read_exact(&mut file, &mut size).map_err(re_err)?;
                 let chunk_len = u32::from_le_bytes(size) as i64;
                 fs.seek(&mut file, embedded_io::SeekFrom::Current(chunk_len))?;
             }
         };
         let wav = active::Wav {
-            tempo: source.wav.tempo,
             steps: source.wav.steps,
             file,
             pcm_start,
             pcm_len,
+            sample_rate,
         };
         Ok(active::Onset {
             index,
@@ -436,6 +462,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         buffer: &mut [T],
         channels: usize,
+        sample_rate: u32,
     ) -> Result<(), F::Error> {
         let reverse = self.reverse();
         let event = if let Some(event) = actives!(mut self)
@@ -451,7 +478,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             Self::read_grain::<T>(
                 self.gain,
                 self.width,
-                self.pitch.net(),
+                self.pitch.net() * onset.wav.sample_rate as f32 / sample_rate as f32,
                 reverse,
                 None,
                 onset,
@@ -464,7 +491,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             Self::read_grain::<T>(
                 self.gain,
                 self.width,
-                self.pitch.net(),
+                self.pitch.net() * onset.wav.sample_rate as f32 / sample_rate as f32,
                 reverse,
                 Some(*len as f32 * self.ticks_per_step as f32 / self.loop_div.net()),
                 onset,
@@ -483,7 +510,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
     fn read_grain<T: core::ops::AddAssign + From<f32>>(
         gain: f32,
         width: f32,
-        pitch: f32,
+        speed: f32,
         reverse: bool,
         len: Option<f32>,
         onset: &mut active::Onset<F>,
@@ -493,10 +520,10 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         channels: usize,
     ) -> Result<(), F::Error> {
         // FIXME: support alternative channel counts?
-        assert!(channels == 2);
+        assert!(channels == 2, "currently only stereo output is supported");
         for i in 0..buffer.len() / channels {
             let sample = reader.read_interpolated(
-                pitch,
+                speed,
                 reverse,
                 len,
                 onset,
@@ -620,9 +647,10 @@ impl<const BANKS: usize, const PADS: usize, const STEPS: usize, const PHRASES: u
         &mut self,
         buffer: &mut [T],
         channels: usize,
+        sample_rate: u32,
     ) -> Result<(), Error<F::Error>> {
         for bank in self.banks.iter_mut() {
-            bank.read_attenuated(&mut self.fs, buffer, channels)?;
+            bank.read_attenuated(&mut self.fs, buffer, channels, sample_rate)?;
         }
         Ok(())
     }
