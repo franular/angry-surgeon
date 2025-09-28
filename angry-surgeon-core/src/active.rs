@@ -65,20 +65,25 @@ pub(crate) enum Event<F: FileHandler> {
 }
 
 impl<F: FileHandler> Event<F> {
+    #[allow(clippy::too_many_arguments)]
     pub fn trans<const PADS: usize, const STEPS: usize>(
         &mut self,
         input: &passive::Event,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
+        grain: &mut pads::GrainReader,
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<(), Error<F::Error>> {
         match input {
             passive::Event::Sync => {
                 if let Event::Hold { onset, .. } | Event::Loop { onset, .. } = self {
+                    grain.fade(Some(&mut onset.wav), fs)?;
                     // close old file
                     fs.close(&onset.wav.file)?;
+                } else {
+                    grain.fade(None, fs)?;
                 }
                 *self = Event::Sync;
             }
@@ -86,6 +91,7 @@ impl<F: FileHandler> Event<F> {
                 match self {
                     Event::Sync => {
                         if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            grain.fade(None, fs)?;
                             // replace onset; no old file to close
                             if let Some(onset) = kit.onset_seek(
                                 None,
@@ -99,6 +105,7 @@ impl<F: FileHandler> Event<F> {
                     }
                     Event::Hold { onset, .. } => {
                         if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            grain.fade(Some(&mut onset.wav), fs)?;
                             // close old file and replace onset
                             if let Some(onset) = kit.onset_seek(
                                 Some(&onset.wav.file),
@@ -127,8 +134,9 @@ impl<F: FileHandler> Event<F> {
                 match self {
                     Event::Sync => {
                         if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            grain.fade(None, fs)?;
                             // replace onset; no old file to close
-                            if let Some(onset) = kit.onset(
+                            if let Some(onset) = kit.onset_seek(
                                 None,
                                 *index,
                                 pads::Kit::<PADS>::generate_pan(*index),
@@ -158,8 +166,9 @@ impl<F: FileHandler> Event<F> {
                                 len: *len,
                             };
                         } else if let Some(kit) = bank.generate_kit(kit_index, kit_drift, rand) {
+                            grain.fade(Some(&mut onset.wav), fs)?;
                             // close old file and replace onset
-                            if let Some(onset) = kit.onset(
+                            if let Some(onset) = kit.onset_seek(
                                 Some(&onset.wav.file),
                                 *index,
                                 pads::Kit::<PADS>::generate_pan(*index),
@@ -206,14 +215,14 @@ impl<F: FileHandler> Active<F> {
 
     /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`, seek to sync to tick
     /// offset from onset
-    pub fn tick(&mut self, xor_reverse: bool, loop_div: f32, fs: &mut F) -> Result<(), Error<F::Error>> {
+    pub fn tick(&mut self, xor_reverse: bool, step_div: u16, loop_div: f32, fs: &mut F) -> Result<(), Error<F::Error>> {
         match &mut self.event {
             Event::Sync => (),
             Event::Hold { onset, tick } => {
                 if self.reverse ^ xor_reverse {
-                    *tick -= 1;
+                    *tick -= step_div as i16;
                 } else {
-                    *tick += 1;
+                    *tick += step_div as i16;
                 }
                 let wav = &mut onset.wav;
                 if let Some(steps) = wav.steps {
@@ -223,9 +232,9 @@ impl<F: FileHandler> Active<F> {
             }
             Event::Loop { onset, tick, len } => {
                 if self.reverse ^ xor_reverse {
-                    *tick -= 1;
+                    *tick -= step_div as i16;
                 } else {
-                    *tick += 1;
+                    *tick += step_div as i16;
                 }
                 let wav = &mut onset.wav;
                 if let Some(steps) = wav.steps {
@@ -256,12 +265,15 @@ impl<F: FileHandler> Default for Input<F> {
 }
 
 impl<F: FileHandler> Input<F> {
+    #[allow(clippy::too_many_arguments)]
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
+        step_div: u16,
         loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
+        reader: &mut pads::GrainReader,
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
@@ -269,10 +281,10 @@ impl<F: FileHandler> Input<F> {
         if let Some(event) = self.buffer.event.take() {
             self.active
                 .event
-                .trans(&event, bank, kit_index, kit_drift, rand, fs)?;
+                .trans(&event, bank, kit_index, kit_drift, reader, rand, fs)?;
             return Ok(Some(event));
         } else {
-            self.active.tick(false, loop_div, fs)?;
+            self.active.tick(false, step_div, loop_div, fs)?;
         }
         Ok(None)
     }
@@ -310,11 +322,13 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
     pub fn tick<const PADS: usize>(
         &mut self,
         xor_reverse: bool,
+        step_div: u16,
         loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
         phrase_drift: f32,
+        grain: &mut pads::GrainReader,
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
@@ -332,17 +346,17 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
                     active_phrase
                         .active
                         .event
-                        .trans(event, bank, kit_index, kit_drift, rand, fs)?;
+                        .trans(event, bank, kit_index, kit_drift, grain, rand, fs)?;
                     return Ok(Some(*event));
                 } else {
-                    active_phrase.active.tick(xor_reverse, loop_div, fs)?;
+                    active_phrase.active.tick(xor_reverse, step_div, loop_div, fs)?;
                 }
             } else {
                 // start active phrase from empty
                 let step = source_phrase.generate_step(0, phrase_drift, rand);
                 let mut event = Event::Sync;
                 let ret = if let Some(ref source) = step.event {
-                    event.trans(source, bank, kit_index, kit_drift, rand, fs)?;
+                    event.trans(source, bank, kit_index, kit_drift, grain, rand, fs)?;
                     Some(*source)
                 } else {
                     None
@@ -421,11 +435,13 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
         xor_reverse: bool,
+        step_div: u16,
         loop_div: f32,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
         phrase_drift: f32,
+        grain: &mut pads::GrainReader,
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
@@ -458,10 +474,10 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                 active_phrase
                     .active
                     .event
-                    .trans(event, bank, kit_index, kit_drift, rand, fs)?;
+                    .trans(event, bank, kit_index, kit_drift, grain, rand, fs)?;
                 return Ok(Some(*event));
             } else {
-                active_phrase.active.tick(xor_reverse, loop_div, fs)?;
+                active_phrase.active.tick(xor_reverse, step_div, loop_div, fs)?;
             }
         } else if let Some(source_phrase) = Self::try_increment_phrase(
             &mut self.phrase_index,
@@ -475,7 +491,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
             let step = source_phrase.generate_step(0, phrase_drift, rand);
             let mut event = Event::Sync;
             let ret = if let Some(ref source) = step.event {
-                event.trans(source, bank, kit_index, kit_drift, rand, fs)?;
+                event.trans(source, bank, kit_index, kit_drift, grain, rand, fs)?;
                 Some(*source)
             } else {
                 None

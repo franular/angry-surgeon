@@ -6,7 +6,7 @@ use tinyrand::Seeded;
 
 pub const SAMPLE_RATE: u16 = 48000;
 pub const PPQ: u16 = 24;
-pub const STEP_DIV: u16 = 4;
+pub const LINES_PER_STEP: u16 = 4;
 
 pub const BANK_COUNT: usize = 2;
 pub const PAD_COUNT: usize = 8;
@@ -169,7 +169,7 @@ impl SystemHandler {
     pub fn new(cmd_rx: Receiver<Cmd>) -> Result<Self> {
         Ok(Self {
             system: angry_surgeon_core::SystemHandler::new(
-                STEP_DIV,
+                LINES_PER_STEP,
                 tinyrand::Wyrand::seed(0xf2aa),
                 crate::fs::LinuxFileHandler {},
             ),
@@ -234,7 +234,7 @@ impl SystemHandler {
         buffer.fill(T::EQUILIBRIUM);
         let f32_buffer: &mut [f32] = unsafe { core::mem::transmute(buffer) };
         self.oneshot.read_attenuated(f32_buffer, channels)?;
-        self.system.read_all(f32_buffer, channels, SAMPLE_RATE)?;
+        self.system.read_all(f32_buffer, channels)?;
         Ok(())
     }
 }

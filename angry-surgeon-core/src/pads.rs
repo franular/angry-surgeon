@@ -1,6 +1,6 @@
 //! main logic-to-audio driver
 
-use crate::{active, passive, Error, FileHandler, GRAIN_LEN};
+use crate::{active, passive, Error, FileHandler};
 use embedded_io::ReadExactError;
 use tinyrand::Rand;
 
@@ -37,62 +37,71 @@ macro_rules! actives {
     };
 }
 
-struct GrainReader {
-    window: [f32; GRAIN_LEN + 1],
-    buffers: [[i16; GRAIN_LEN + 1]; 4],
-    fresh: usize,
+/// grain length in frames
+pub const GRAIN_LEN: usize = 1024;
+/// crossfade length in frames
+const FADE_LEN: usize = 64;
+
+pub(crate) struct GrainReader {
+    buffer: [i16; GRAIN_LEN + 1], // +1 frame for interpolation
+    fade_head: Option<[i16; FADE_LEN]>,
+    fade_tail: Option<[i16; FADE_LEN]>,
     index: f32,
 }
 
 impl GrainReader {
     fn new() -> Self {
-        // let window = core::array::from_fn(|i| {
-        //     0.5 - 0.5 * f32::cos(2. * core::f32::consts::PI * i as f32 / GRAIN_LEN as f32)
-        // });
-        let fold = |val, max| {
-            if val > max {
-                2. * max - val
-            } else {
-                val
-            }
-        };
-        let window = core::array::from_fn(|i| {
-            fold(i as f32 / GRAIN_LEN as f32 * 2., 1.)
-        });
         Self {
-            window,
-            buffers: [[0; GRAIN_LEN + 1]; 4],
-            fresh: 0,
+            buffer: [0; GRAIN_LEN + 1],
+            fade_head: None,
+            fade_tail: None,
             index: 0.,
         }
     }
 
+    pub fn fade<F: FileHandler>(&mut self, wav: Option<&mut active::Wav<F>>, fs: &mut F) -> Result<(), F::Error> {
+        let fade_tail = self.fade_tail.get_or_insert([0; FADE_LEN]);
+        let fade_head = self.fade_head.get_or_insert([0; FADE_LEN]);
+        if let Some(wav) = wav {
+            let end_pos = wav.pos(fs)?;
+            let bytes = bytemuck::cast_slice_mut(fade_tail);
+            wav.read(bytes, fs)?;
+            let bytes = bytemuck::cast_slice_mut(fade_head);
+            wav.seek(end_pos as i64 - (GRAIN_LEN + FADE_LEN) as i64, fs)?;
+            wav.read(bytes, fs)?;
+        }
+        Ok(())
+    }
+
     fn fill<F: FileHandler>(&mut self, wav: &mut active::Wav<F>, fs: &mut F) -> Result<u64, F::Error> {
+        // prepare next crossfade
         let init_pos = wav.pos(fs)?;
-        self.fresh = (self.fresh + 1) % 4;
-        let bytes = bytemuck::cast_slice_mut(&mut self.buffers[self.fresh][..]);
+        let bytes = bytemuck::cast_slice_mut(&mut self.buffer[..]);
         wav.read(bytes, fs)?;
         Ok(init_pos)
     }
 
-    fn sample(&self, index: usize) -> f32 {
-        let index0 = index + GRAIN_LEN / 4 * ((4 + self.fresh) % 4);
-        let index1 = index + GRAIN_LEN / 4 * ((3 + self.fresh) % 4);
-        let index2 = index + GRAIN_LEN / 4 * ((2 + self.fresh) % 4);
-        let index3 = index + GRAIN_LEN / 4 * ((1 + self.fresh) % 4);
-        self.buffers[0][index0] as f32 / i16::MAX as f32
-            * self.window[index0]
-            + self.buffers[1][index1] as f32 / i16::MAX as f32
-            * self.window[index1]
-            + self.buffers[2][index2] as f32 / i16::MAX as f32
-            * self.window[index2]
-            + self.buffers[3][index3] as f32 / i16::MAX as f32
-            * self.window[index3]
+    fn sample(&mut self, index: usize) -> f32 {
+        if index < FADE_LEN {
+            if let Some(tail) = self.fade_tail {
+                return self.buffer[index] as f32 / i16::MAX as f32
+                    * (index + 1) as f32 / (FADE_LEN + 1) as f32
+                    + tail[index] as f32 / i16::MAX as f32
+                    * (FADE_LEN - index) as f32 / (FADE_LEN + 1) as f32;
+            }
+        } else if index >= GRAIN_LEN - FADE_LEN {
+            if let Some(head) = self.fade_head {
+                return self.buffer[index] as f32 / i16::MAX as f32
+                    * (GRAIN_LEN - index) as f32 / (FADE_LEN + 1) as f32
+                    + head[index + FADE_LEN - GRAIN_LEN] as f32 / i16::MAX as f32
+                    * (index + FADE_LEN - GRAIN_LEN + 1) as f32 / (FADE_LEN + 1) as f32;
+            }
+        }
+        self.buffer[index] as f32 / i16::MAX as f32
     }
 
     fn read_interpolated<F: FileHandler>(
         &mut self,
-        stretch: f32,
         speed: f32,
         reverse: bool,
         len: Option<f32>,
@@ -115,23 +124,27 @@ impl GrainReader {
                 }
             }
         }
-        // handle ola
-        if self.index as i64 >= GRAIN_LEN as i64 / 4 {
+        // handle grain refill
+        if self.index as i64 >= GRAIN_LEN as i64 {
+            self.fade_tail = None;
+            self.fade_head = None;
             let init_pos = self.fill(&mut onset.wav, fs)?;
             onset.wav.seek(
-                init_pos as i64 + ((GRAIN_LEN / 2) as f32 * stretch) as i64 & !1,
+                init_pos as i64 + GRAIN_LEN as i64 * 2,
                 fs,
             )?;
             // wrap to 0..GRAIN_LEN
-            self.index %= (GRAIN_LEN / 4) as f32;
-        } else if self.index as i64 <= GRAIN_LEN as i64 / -4 {
+            self.index %= GRAIN_LEN as f32;
+        } else if self.index as i64 <= -(GRAIN_LEN as i64) {
+            self.fade_tail = None;
+            self.fade_head = None;
             let init_pos = self.fill(&mut onset.wav, fs)?;
             onset.wav.seek(
-                init_pos as i64 - ((GRAIN_LEN / 2) as f32 * stretch) as i64 & !1,
+                init_pos as i64 - GRAIN_LEN as i64 * 2,
                 fs,
             )?;
             // wrap to 0..-GRAIN_LEN
-            self.index = -(self.index.abs() % (GRAIN_LEN / 4) as f32);
+            self.index = -(self.index.abs() % GRAIN_LEN as f32);
         }
         // linear interpolation
         let word_a = self.sample(self.index.rem_euclid(GRAIN_LEN as f32) as usize) * (1. - self.index.fract());
@@ -162,20 +175,6 @@ impl<const PADS: usize> Default for Kit<PADS> {
 impl<const PADS: usize> Kit<PADS> {
     pub(crate) fn generate_pan(index: impl Into<usize>) -> f32 {
         index.into() as f32 / PADS as f32 - 0.5
-    }
-
-    pub(crate) fn onset<F: FileHandler>(
-        &self,
-        to_close: Option<&F::File>,
-        index: u8,
-        pan: f32,
-        fs: &mut F,
-    ) -> Result<Option<active::Onset<F>>, Error<F::Error>> {
-        if let Some(source) = self.onsets[index as usize].as_ref() {
-            Ok(Some(Self::onset_inner(source, to_close, index, pan, fs)?))
-        } else {
-            Ok(None)
-        }
     }
 
     pub(crate) fn onset_seek<F: FileHandler>(
@@ -320,7 +319,7 @@ pub struct BankHandler<const PADS: usize, const STEPS: usize, const PHRASES: usi
 {
     quant: bool,
     tempo: f32,
-    step_div: u16,
+    ticks_per_step: u16,
     pub loop_div: Mod<f32>,
 
     pub gain: f32,
@@ -335,17 +334,17 @@ pub struct BankHandler<const PADS: usize, const STEPS: usize, const PHRASES: usi
     input: active::Input<F>,
     record: active::Record<STEPS, F>,
     sequence: active::Sequence<PHRASES, F>,
-    reader: GrainReader,
+    grain: GrainReader,
 }
 
 impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler>
     BankHandler<PADS, STEPS, PHRASES, F>
 {
-    fn new(step_div: u16) -> Self {
+    fn new(ticks_per_step: u16) -> Self {
         Self {
             quant: false,
             tempo: 0.,
-            step_div,
+            ticks_per_step,
             loop_div: Mod::new(8., 1.),
 
             gain: 0.5,
@@ -360,7 +359,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             input: active::Input::default(),
             record: active::Record::default(),
             sequence: active::Sequence::default(),
-            reader: GrainReader::new(),
+            grain: GrainReader::new(),
         }
     }
 
@@ -381,6 +380,7 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             &self.bank,
             self.kit_index,
             self.kit_drift,
+            &mut self.grain,
             rand,
             fs,
         )?;
@@ -436,7 +436,6 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         fs: &mut F,
         buffer: &mut [T],
         channels: usize,
-        sample_rate: u16,
     ) -> Result<(), F::Error> {
         let reverse = self.reverse();
         let event = if let Some(event) = actives!(mut self)
@@ -450,30 +449,26 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
 
         if let active::Event::Hold { onset, .. } = event {
             Self::read_grain::<T>(
-                self.tempo,
-                self.step_div,
                 self.gain,
                 self.width,
                 self.pitch.net(),
                 reverse,
                 None,
                 onset,
-                &mut self.reader,
+                &mut self.grain,
                 fs,
                 buffer,
                 channels,
             )
         } else if let active::Event::Loop { onset, len, .. } = event {
             Self::read_grain::<T>(
-                self.tempo,
-                self.step_div,
                 self.gain,
                 self.width,
                 self.pitch.net(),
                 reverse,
-                Some(*len as f32 / self.loop_div.net()),
+                Some(*len as f32 * self.ticks_per_step as f32 / self.loop_div.net()),
                 onset,
-                &mut self.reader,
+                &mut self.grain,
                 fs,
                 buffer,
                 channels,
@@ -486,8 +481,6 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
     /// associated method to appease borrow rules
     #[allow(clippy::too_many_arguments)]
     fn read_grain<T: core::ops::AddAssign + From<f32>>(
-        tempo: f32,
-        step_div: u16,
         gain: f32,
         width: f32,
         pitch: f32,
@@ -499,16 +492,10 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
         buffer: &mut [T],
         channels: usize,
     ) -> Result<(), F::Error> {
-        let stretch = onset
-            .wav
-            .tempo
-            .map(|v| tempo * step_div as f32 / v / pitch)
-            .unwrap_or(1.);
         // FIXME: support alternative channel counts?
         assert!(channels == 2);
         for i in 0..buffer.len() / channels {
             let sample = reader.read_interpolated(
-                stretch,
                 pitch,
                 reverse,
                 len,
@@ -526,30 +513,36 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
     fn tick(&mut self, rand: &mut impl Rand, fs: &mut F) -> Result<(), Error<F::Error>> {
         self.quant = true;
         let input_event = self.input.tick(
+            self.ticks_per_step,
             self.loop_div.net(),
             &self.bank,
             self.kit_index,
             self.kit_drift,
+            &mut self.grain,
             rand,
             fs,
         )?;
         let record_event = self.record.tick(
             self.input.active.reverse,
+            self.ticks_per_step,
             self.loop_div.net(),
             &self.bank,
             self.kit_index,
             self.kit_drift,
             self.phrase_drift,
+            &mut self.grain,
             rand,
             fs,
         )?;
         let sequence_event = self.sequence.tick(
             self.input.active.reverse,
+            self.ticks_per_step,
             self.loop_div.net(),
             &self.bank,
             self.kit_index,
             self.kit_drift,
             self.phrase_drift,
+            &mut self.grain,
             rand,
             fs,
         )?;
@@ -558,25 +551,29 @@ impl<const PADS: usize, const STEPS: usize, const PHRASES: usize, F: FileHandler
             event,
             reverse: self.reverse(),
         });
-        for active in actives!(mut self).into_iter().flatten() {
-            // sync all actives with clock
-            match &mut active.event {
-                active::Event::Sync => (),
-                active::Event::Hold { onset, tick } => {
-                    let wav = &mut onset.wav;
-                    if let Some(steps) = wav.steps {
-                        let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
-                        wav.seek(onset.start as i64 * 2 + offset, fs)?;
+        if event.is_none() {
+            for active in actives!(mut self).into_iter().flatten() {
+                // sync all actives with clock
+                match &mut active.event {
+                    active::Event::Sync => (),
+                    active::Event::Hold { onset, tick } => {
+                        // quantize running active
+                        let wav = &mut onset.wav;
+                        if let Some(steps) = wav.steps {
+                            let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
+                            wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                        }
                     }
-                }
-                active::Event::Loop { onset, tick, len } => {
-                    let wav = &mut onset.wav;
-                    if let Some(steps) = wav.steps {
-                        let offset = (wav.pcm_len as f32 / steps as f32
-                            * (*tick as f32).rem_euclid(*len as f32 / self.loop_div.net()))
-                            as i64
-                            & !1;
-                        wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                    active::Event::Loop { onset, tick, len } => {
+                        // quantize running active to step
+                        let wav = &mut onset.wav;
+                        if let Some(steps) = wav.steps {
+                            let offset = (wav.pcm_len as f32 / steps as f32
+                                * (*tick as f32).rem_euclid(*len as f32 * self.ticks_per_step as f32 / self.loop_div.net()))
+                                as i64
+                                & !1;
+                            wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                        }
                     }
                 }
             }
@@ -623,10 +620,9 @@ impl<const BANKS: usize, const PADS: usize, const STEPS: usize, const PHRASES: u
         &mut self,
         buffer: &mut [T],
         channels: usize,
-        sample_rate: u16,
     ) -> Result<(), Error<F::Error>> {
         for bank in self.banks.iter_mut() {
-            bank.read_attenuated(&mut self.fs, buffer, channels, sample_rate)?;
+            bank.read_attenuated(&mut self.fs, buffer, channels)?;
         }
         Ok(())
     }

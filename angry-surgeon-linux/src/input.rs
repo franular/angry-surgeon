@@ -1,5 +1,5 @@
 use crate::{audio, tui};
-use audio::{Bank, MAX_PHRASE_LEN, PAD_COUNT, PPQ, STEP_DIV};
+use audio::{Bank, MAX_PHRASE_LEN, PAD_COUNT, PPQ, LINES_PER_STEP};
 
 use angry_surgeon_core::{Event, Onset, Wav};
 use color_eyre::Result;
@@ -883,14 +883,14 @@ impl InputHandler {
             let now = std::time::Instant::now();
             if let Some(delta) = self.last_step {
                 let ioi = now.duration_since(delta);
-                let tempo = 60. / ioi.as_secs_f32() / STEP_DIV as f32;
+                let tempo = 60. / ioi.as_secs_f32() / audio::LINES_PER_STEP as f32;
                 self.audio_tx.send(audio::Cmd::AssignTempo(tempo))?;
             }
             self.last_step = Some(now);
             self.audio_tx.send(audio::Cmd::Tick)?;
             self.tui_tx.send(tui::Cmd::Clock)?;
         }
-        self.clock = (self.clock + 1) % (PPQ / STEP_DIV);
+        self.clock = (self.clock + 1) % (PPQ / LINES_PER_STEP);
         Ok(())
     }
 

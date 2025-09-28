@@ -8,10 +8,8 @@ mod active;
 mod pads;
 mod passive;
 
-pub use pads::{Bank, SystemHandler};
+pub use pads::{Bank, SystemHandler, GRAIN_LEN};
 pub use passive::{Event, Onset, Rd, Wav};
-
-pub const GRAIN_LEN: usize = 4096;
 
 #[derive(Debug)]
 pub enum Error<E: Debug> {
