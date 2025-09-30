@@ -25,7 +25,11 @@ impl<F: FileHandler> Wav<F> {
     }
 
     pub fn seek(&mut self, offset: i64, fs: &mut F) -> Result<(), F::Error> {
-        fs.seek(&mut self.file, SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64)).map(|_| ())
+        fs.seek(
+            &mut self.file,
+            SeekFrom::Start(self.pcm_start + offset.rem_euclid(self.pcm_len as i64) as u64),
+        )
+        .map(|_| ())
     }
 
     // read that loops without crossfade as fallback
@@ -81,10 +85,8 @@ impl<F: FileHandler> Event<F> {
                     grain.fade(Some(&mut onset.wav), fs)?;
                     // close old file
                     fs.close(&onset.wav.file)?;
-                } else {
-                    grain.fade(None, fs)?;
+                    *self = Event::Sync;
                 }
-                *self = Event::Sync;
             }
             passive::Event::Hold { index } => {
                 match self {
@@ -212,40 +214,26 @@ impl<F: FileHandler> Active<F> {
         }
     }
 
-    /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`, seek to sync to tick
-    /// offset from onset
-    pub fn tick(&mut self, xor_reverse: bool, step_div: u16, loop_div: f32, fs: &mut F) -> Result<(), Error<F::Error>> {
+    /// in-/decrement tick w/ `self.reverse` ^ `xor_reverse`
+    /// the seeks are done in BankHandler::tick() for single crossfade
+    pub fn tick(&mut self, xor_reverse: bool, ticks_per_step: u16) {
         match &mut self.event {
             Event::Sync => (),
-            Event::Hold { onset, tick } => {
+            Event::Hold { tick, .. } => {
                 if self.reverse ^ xor_reverse {
-                    *tick -= step_div as i16;
+                    *tick -= ticks_per_step as i16;
                 } else {
-                    *tick += step_div as i16;
-                }
-                let wav = &mut onset.wav;
-                if let Some(steps) = wav.steps {
-                    let offset = (wav.pcm_len as f32 / steps as f32 * *tick as f32) as i64 & !1;
-                    wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                    *tick += ticks_per_step as i16;
                 }
             }
-            Event::Loop { onset, tick, len } => {
+            Event::Loop { tick, .. } => {
                 if self.reverse ^ xor_reverse {
-                    *tick -= step_div as i16;
+                    *tick -= ticks_per_step as i16;
                 } else {
-                    *tick += step_div as i16;
-                }
-                let wav = &mut onset.wav;
-                if let Some(steps) = wav.steps {
-                    let offset = (wav.pcm_len as f32 / steps as f32
-                        * (*tick as f32).rem_euclid(*len as f32 / loop_div))
-                        as i64
-                        & !1;
-                    wav.seek(onset.start as i64 * 2 + offset, fs)?;
+                    *tick += ticks_per_step as i16;
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -267,12 +255,11 @@ impl<F: FileHandler> Input<F> {
     #[allow(clippy::too_many_arguments)]
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
-        step_div: u16,
-        loop_div: f32,
+        ticks_per_step: u16,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
-        reader: &mut pads::GrainReader,
+        grain: &mut pads::GrainReader,
         rand: &mut impl Rand,
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
@@ -280,10 +267,10 @@ impl<F: FileHandler> Input<F> {
         if let Some(event) = self.buffer.event.take() {
             self.active
                 .event
-                .trans(&event, bank, kit_index, kit_drift, reader, rand, fs)?;
+                .trans(&event, bank, kit_index, kit_drift, grain, rand, fs)?;
             return Ok(Some(event));
         } else {
-            self.active.tick(false, step_div, loop_div, fs)?;
+            self.active.tick(false, ticks_per_step);
         }
         Ok(None)
     }
@@ -321,8 +308,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
     pub fn tick<const PADS: usize>(
         &mut self,
         xor_reverse: bool,
-        step_div: u16,
-        loop_div: f32,
+        ticks_per_step: u16,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
@@ -334,8 +320,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
         if let Some(source_phrase) = self.source_phrase.as_ref() {
             if let Some(active_phrase) = self.active_phrase.as_mut() {
                 // increment step
-                active_phrase.step_index =
-                    (active_phrase.step_index + 1) % source_phrase.len;
+                active_phrase.step_index = (active_phrase.step_index + 1) % source_phrase.len;
                 let step =
                     source_phrase.generate_step(active_phrase.step_index, phrase_drift, rand);
 
@@ -348,7 +333,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
                         .trans(event, bank, kit_index, kit_drift, grain, rand, fs)?;
                     return Ok(Some(*event));
                 } else {
-                    active_phrase.active.tick(xor_reverse, step_div, loop_div, fs)?;
+                    active_phrase.active.tick(xor_reverse, ticks_per_step);
                 }
             } else {
                 // start active phrase from empty
@@ -390,7 +375,7 @@ impl<const STEPS: usize, F: FileHandler> Record<STEPS, F> {
         self.active_phrase = None;
         self.source_phrase.take()
     }
-    
+
     fn save(&mut self) {
         let mut steps = [passive::Step::default(); STEPS];
         let (front, back) = self.queue.as_slices();
@@ -434,8 +419,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
     pub fn tick<const PADS: usize, const STEPS: usize>(
         &mut self,
         xor_reverse: bool,
-        step_div: u16,
-        loop_div: f32,
+        ticks_per_step: u16,
         bank: &pads::Bank<PADS, STEPS>,
         kit_index: u8,
         kit_drift: f32,
@@ -445,7 +429,9 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
         fs: &mut F,
     ) -> Result<Option<passive::Event>, Error<F::Error>> {
         if let Some(active_phrase) = self.active_phrase.as_mut() {
-            let source_phrase = self.source_phrase.and_then(|v| bank.phrases[v as usize].as_ref());
+            let source_phrase = self
+                .source_phrase
+                .and_then(|v| bank.phrases[v as usize].as_ref());
 
             let source_phrase = if source_phrase.is_some_and(|v| active_phrase.step_index < v.len) {
                 // increment step
@@ -476,7 +462,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
                     .trans(event, bank, kit_index, kit_drift, grain, rand, fs)?;
                 return Ok(Some(*event));
             } else {
-                active_phrase.active.tick(xor_reverse, step_div, loop_div, fs)?;
+                active_phrase.active.tick(xor_reverse, ticks_per_step);
             }
         } else if let Some(source_phrase) = Self::try_increment_phrase(
             &mut self.phrase_index,

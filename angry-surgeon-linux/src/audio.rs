@@ -1,12 +1,15 @@
 use angry_surgeon_core::{Event, Onset};
 use color_eyre::Result;
 use cpal::{FromSample, SizedSample};
-use std::{io::{Read, Seek, Write}, sync::mpsc::Receiver};
+use std::{
+    io::{Read, Seek},
+    sync::mpsc::Receiver,
+};
 use tinyrand::Seeded;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const PPQ: u16 = 24;
-pub const LINES_PER_STEP: u16 = 4;
+pub const TICKS_PER_STEP: u16 = 4;
 
 pub const BANK_COUNT: usize = 2;
 pub const PAD_COUNT: usize = 8;
@@ -77,10 +80,12 @@ impl<const LEN: usize> Oneshot<LEN> {
 
     fn load(&mut self, mut file: Option<std::fs::File>) -> Result<()> {
         if let Some(file) = file.as_mut() {
-            let assert = |b: bool| if !b {
-                Err(color_eyre::Report::msg("bad .wav"))
-            } else {
-                Ok(())
+            let assert = |b: bool| {
+                if !b {
+                    Err(color_eyre::Report::msg("bad .wav"))
+                } else {
+                    Ok(())
+                }
             };
             // parse wav looking for metadata and `data` subchunk
             let mut pcm_start = 0;
@@ -124,7 +129,7 @@ impl<const LEN: usize> Oneshot<LEN> {
                     let chunk_len = u32::from_le_bytes(size) as i64;
                     file.seek_relative(chunk_len)?;
                 }
-            };
+            }
             file.seek(std::io::SeekFrom::Start(pcm_start))?;
         }
         self.file = file;
@@ -196,7 +201,7 @@ impl SystemHandler {
     pub fn new(cmd_rx: Receiver<Cmd>) -> Result<Self> {
         Ok(Self {
             system: angry_surgeon_core::SystemHandler::new(
-                LINES_PER_STEP,
+                TICKS_PER_STEP,
                 tinyrand::Wyrand::seed(0xf2aa),
                 crate::fs::LinuxFileHandler {},
             ),
@@ -219,9 +224,8 @@ impl SystemHandler {
                 Cmd::Stop => self.system.stop(),
                 Cmd::AssignTempo(v) => self.system.assign_tempo(v),
                 Cmd::OffsetPitch(v) => {
-                    for bank in self.system.banks.iter_mut() {
-                        bank.pitch.offset = v;
-                    }
+                    // only affects second bank
+                    self.system.banks[1].pitch.offset = v;
                 }
                 Cmd::Bank(bank, cmd) => {
                     let bank_h = &mut self.system.banks[bank as u8 as usize];
@@ -233,16 +237,12 @@ impl SystemHandler {
                         BankCmd::AssignKitDrift(v) => bank_h.kit_drift = v,
                         BankCmd::AssignPhraseDrift(v) => bank_h.phrase_drift = v,
 
-                        BankCmd::SaveBank(mut file) => {
-                            let json = serde_json::to_string_pretty(&bank_h.bank)?;
-                            write!(file, "{}", json)?;
+                        BankCmd::SaveBank(file) => {
+                            serde_json::to_writer_pretty(file, &bank_h.bank)?;
                         }
                         BankCmd::LoadBank(bank) => bank_h.bank = *bank,
                         BankCmd::LoadKit(index) => bank_h.kit_index = index,
-                        BankCmd::AssignOnset(index, onset) => bank_h.assign_onset(
-                            index,
-                            *onset,
-                        ),
+                        BankCmd::AssignOnset(index, onset) => bank_h.assign_onset(index, *onset),
                         BankCmd::ForceEvent(event) => {
                             bank_h.force_event(event, &mut self.system.rand, &mut self.system.fs)?
                         }

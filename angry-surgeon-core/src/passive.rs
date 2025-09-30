@@ -55,7 +55,12 @@ pub struct Phrase<const STEPS: usize> {
 }
 
 impl<const STEPS: usize> Phrase<STEPS> {
-    pub(crate) fn generate_step(&self, step_index: u16, phrase_drift: f32, rand: &mut impl Rand) -> Step {
+    pub(crate) fn generate_step(
+        &self,
+        step_index: u16,
+        phrase_drift: f32,
+        rand: &mut impl Rand,
+    ) -> Step {
         let drift = phrase_drift * self.len as f32;
         let drift = rand.next_lim_usize(drift as usize + 1)
             + rand.next_bool(tinyrand::Probability::new(drift.fract() as f64)) as usize;

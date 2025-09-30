@@ -36,4 +36,3 @@ impl angry_surgeon_core::FileHandler for LinuxFileHandler {
         file.seek(pos)
     }
 }
-

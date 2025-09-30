@@ -10,7 +10,10 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, Widget, Wrap},
     DefaultTerminal, Frame,
 };
-use std::{path::Path, sync::mpsc::{Receiver, Sender}};
+use std::{
+    path::Path,
+    sync::mpsc::{Receiver, Sender},
+};
 
 pub const FILE_COUNT: usize = 5;
 const LOG_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -308,7 +311,10 @@ struct Oneshots {
 
 impl Oneshots {
     fn new() -> Self {
-        Self { paths: Vec::new(), index: None }
+        Self {
+            paths: Vec::new(),
+            index: None,
+        }
     }
 
     fn open(&mut self, dir: impl AsRef<Path>) -> Result<()> {
@@ -316,7 +322,9 @@ impl Oneshots {
         self.paths.clear();
         for entry in std::fs::read_dir(dir)?.filter_map(|v| v.ok()) {
             let path = entry.path();
-            if entry.metadata()?.is_file() && path.extension().is_some_and(|v| v.to_str() == Some("wav")) {
+            if entry.metadata()?.is_file()
+                && path.extension().is_some_and(|v| v.to_str() == Some("wav"))
+            {
                 self.paths.push(path.into_boxed_path());
             }
         }
@@ -341,7 +349,10 @@ pub struct TuiHandler {
 }
 
 impl TuiHandler {
-    pub fn new(audio_tx: Sender<crate::audio::Cmd>, input_tx: Sender<crate::input::Cmd>) -> Result<Self> {
+    pub fn new(
+        audio_tx: Sender<crate::audio::Cmd>,
+        input_tx: Sender<crate::input::Cmd>,
+    ) -> Result<Self> {
         Ok(Self {
             oneshots: Oneshots::new(),
 
@@ -435,22 +446,31 @@ impl TuiHandler {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Press,
                 ..
-            }) => if !self.oneshots.paths.is_empty() {
-                if let Some(i) = self.oneshots.index.as_mut() {
-                    if *i < self.oneshots.paths.len() - 1 {
-                        *i += 1;
+            }) => {
+                if !self.oneshots.paths.is_empty() {
+                    if let Some(i) = self.oneshots.index.as_mut() {
+                        if *i < self.oneshots.paths.len() - 1 {
+                            *i += 1;
+                        } else {
+                            self.oneshots.index = None;
+                        }
                     } else {
-                        self.oneshots.index = None;
+                        self.oneshots.index = Some(0);
                     }
-                } else {
-                    self.oneshots.index = Some(0);
-                }
-                if let Some(index) = self.oneshots.index {
-                    self.audio_tx.send(crate::audio::Cmd::LoadOneshot(std::fs::File::open(self.oneshots.paths[index].clone())?))?;
-                    self.log = Some((std::time::Instant::now(), format!("oneshot {:>3}/{:>3}", index, self.oneshots.paths.len())));
-                } else {
-                    self.audio_tx.send(crate::audio::Cmd::StopOneshot)?;
-                    self.log = Some((std::time::Instant::now(), "oneshots exhausted".to_string()));
+                    if let Some(index) = self.oneshots.index {
+                        self.audio_tx
+                            .send(crate::audio::Cmd::LoadOneshot(std::fs::File::open(
+                                self.oneshots.paths[index].clone(),
+                            )?))?;
+                        self.log = Some((
+                            std::time::Instant::now(),
+                            format!("oneshot {:>3}/{:>3}", index, self.oneshots.paths.len()),
+                        ));
+                    } else {
+                        self.audio_tx.send(crate::audio::Cmd::StopOneshot)?;
+                        self.log =
+                            Some((std::time::Instant::now(), "oneshots exhausted".to_string()));
+                    }
                 }
             }
             event::Event::Key(KeyEvent {
