@@ -39,14 +39,14 @@ enum FadeState {
 }
 
 struct Fade {
-    buffer: [i16; FADE_LEN],
+    buffer: [i16; FADE_LEN + 1],
     state: FadeState,
 }
 
 impl Fade {
     fn new() -> Self {
         Self {
-            buffer: [0; FADE_LEN],
+            buffer: [0; FADE_LEN + 1],
             state: FadeState::None,
         }
     }
@@ -54,7 +54,7 @@ impl Fade {
 
 pub(crate) struct GrainReader {
     buffer: [i16; GRAIN_LEN + 1], // +1 frame for interpolation
-    window: [f32; FADE_LEN],      // for crossfade
+    window: [f32; FADE_LEN + 1], // for crossfade
     tail: Fade,
     head: Fade,
     index: f32,
@@ -95,25 +95,30 @@ impl GrainReader {
     ) -> Result<(), F::Error> {
         if let Some(wav) = wav {
             let end_pos = wav.pos(fs)?;
-            let bytes = bytemuck::cast_slice_mut(&mut tail.buffer);
             if tail.state == FadeState::None {
                 tail.state = FadeState::Primed;
+                let bytes = bytemuck::cast_slice_mut(&mut tail.buffer);
                 wav.read(bytes, fs)?;
             }
             wav.seek(
                 end_pos as i64 - GRAIN_LEN as i64 * 2 - FADE_LEN as i64 * 2,
                 fs,
             )?;
-            let bytes = bytemuck::cast_slice_mut(&mut head.buffer);
-            wav.read(bytes, fs)?;
             if head.state == FadeState::None {
                 head.state = FadeState::Primed;
+                let bytes = bytemuck::cast_slice_mut(&mut head.buffer);
                 wav.read(bytes, fs)?;
             }
             wav.seek(end_pos as i64, fs)?; // this is probably redundant
         } else {
-            tail.buffer.fill(0);
-            head.buffer.fill(0);
+            if tail.state == FadeState::None {
+                tail.state = FadeState::Primed;
+                tail.buffer.fill(0);
+            }
+            if head.state == FadeState::None {
+                head.state = FadeState::Primed;
+                head.buffer.fill(0);
+            }
         }
         Ok(())
     }
@@ -217,14 +222,14 @@ impl GrainReader {
             self.index = self.index.rem_euclid(GRAIN_LEN as f32);
         }
         // linear interpolation
-        let word_a = self.sample(self.index as usize);
-        let word_b = 0.;
-        // let word_a = self.sample(self.index as usize) * (1. - self.index.fract());
-        // let word_b = self.sample(self.index as usize + 1) * self.index.fract();
+        // let word_a = self.sample(self.index as usize + 1);
+        // let word_b = 0.;
+        let word_a = self.sample(self.index as usize) * (1. - self.index.fract());
+        let word_b = self.sample(self.index as usize + 1) * self.index.fract();
         if reverse {
-            self.index -= 1.3;
+            self.index -= speed;
         } else {
-            self.index += 1.3;
+            self.index += speed;
         }
         Ok(word_a + word_b)
     }
