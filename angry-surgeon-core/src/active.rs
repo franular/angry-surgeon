@@ -499,6 +499,7 @@ impl<const PHRASES: usize, F: FileHandler> Sequence<PHRASES, F> {
         self.phrase_index = 0;
         self.phrases.clear();
         self.source_phrase = None;
+        self.active_phrase = None;
     }
 
     pub fn push(&mut self, index: u8) {

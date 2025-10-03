@@ -94,22 +94,19 @@ impl GrainReader {
         fs: &mut F,
     ) -> Result<(), F::Error> {
         if let Some(wav) = wav {
-            let end_pos = wav.pos(fs)?;
+            let edge_pos = wav.pos(fs)?;
             if tail.state == FadeState::None {
                 tail.state = FadeState::Primed;
                 let bytes = bytemuck::cast_slice_mut(&mut tail.buffer);
                 wav.read(bytes, fs)?;
             }
-            wav.seek(
-                end_pos as i64 - GRAIN_LEN as i64 * 2 - FADE_LEN as i64 * 2,
-                fs,
-            )?;
+            wav.seek(edge_pos as i64 - FADE_LEN as i64 * 2, fs)?;
             if head.state == FadeState::None {
                 head.state = FadeState::Primed;
                 let bytes = bytemuck::cast_slice_mut(&mut head.buffer);
                 wav.read(bytes, fs)?;
             }
-            wav.seek(end_pos as i64, fs)?; // this is probably redundant
+            wav.seek(edge_pos as i64, fs)?; // this is probably redundant
         } else {
             if tail.state == FadeState::None {
                 tail.state = FadeState::Primed;
@@ -222,8 +219,6 @@ impl GrainReader {
             self.index = self.index.rem_euclid(GRAIN_LEN as f32);
         }
         // linear interpolation
-        // let word_a = self.sample(self.index as usize + 1);
-        // let word_b = 0.;
         let word_a = self.sample(self.index as usize) * (1. - self.index.fract());
         let word_b = self.sample(self.index as usize + 1) * self.index.fract();
         if reverse {
