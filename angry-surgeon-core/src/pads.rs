@@ -29,7 +29,7 @@ macro_rules! actives_mut {
 /// grain length in frames
 pub const GRAIN_LEN: usize = 1024;
 /// crossfade length in frames
-const FADE_LEN: usize = 256;
+const FADE_LEN: usize = 128;
 
 #[derive(PartialEq)]
 enum FadeState {
@@ -79,44 +79,44 @@ impl GrainReader {
         wav: Option<&mut active::Wav<F>>,
         fs: &mut F,
     ) -> Result<(), F::Error> {
-        Self::fade_inner(
-            &mut self.tail,
-            &mut self.head,
-            wav,
-            fs,
-        )
+        if let Some(wav) = wav {
+            Self::fade_inner(
+                &mut self.tail,
+                &mut self.head,
+                wav,
+                fs,
+            )?;
+        } else {
+            // FIXME: this
+            self.buffer.fill(0);
+            self.index = 0.;
+            self.tail.state = FadeState::Fading;
+            self.tail.buffer.fill(0);
+            self.head.state = FadeState::Fading;
+            self.head.buffer.fill(0);
+        }
+        Ok(())
     }
 
     fn fade_inner<F: FileHandler>(
         tail: &mut Fade,
         head: &mut Fade,
-        wav: Option<&mut active::Wav<F>>,
+        wav: &mut active::Wav<F>,
         fs: &mut F,
     ) -> Result<(), F::Error> {
-        if let Some(wav) = wav {
-            let edge_pos = wav.pos(fs)?;
-            if tail.state == FadeState::None {
-                tail.state = FadeState::Primed;
-                let bytes = bytemuck::cast_slice_mut(&mut tail.buffer);
-                wav.read(bytes, fs)?;
-            }
-            wav.seek(edge_pos as i64 - FADE_LEN as i64 * 2, fs)?;
-            if head.state == FadeState::None {
-                head.state = FadeState::Primed;
-                let bytes = bytemuck::cast_slice_mut(&mut head.buffer);
-                wav.read(bytes, fs)?;
-            }
-            wav.seek(edge_pos as i64, fs)?; // this is probably redundant
-        } else {
-            if tail.state == FadeState::None {
-                tail.state = FadeState::Primed;
-                tail.buffer.fill(0);
-            }
-            if head.state == FadeState::None {
-                head.state = FadeState::Primed;
-                head.buffer.fill(0);
-            }
+        let edge_pos = wav.pos(fs)?;
+        if tail.state == FadeState::None {
+            tail.state = FadeState::Primed;
+            let bytes = bytemuck::cast_slice_mut(&mut tail.buffer);
+            wav.read(bytes, fs)?;
         }
+        wav.seek(edge_pos as i64 - FADE_LEN as i64 * 2, fs)?;
+        if head.state == FadeState::None {
+            head.state = FadeState::Primed;
+            let bytes = bytemuck::cast_slice_mut(&mut head.buffer);
+            wav.read(bytes, fs)?;
+        }
+        wav.seek(edge_pos as i64, fs)?; // this is probably redundant
         Ok(())
     }
 
@@ -135,7 +135,7 @@ impl GrainReader {
                 Self::fade_inner(
                     &mut self.tail,
                     &mut self.head,
-                    Some(wav),
+                    wav,
                     fs,
                 )?;
                 wav.seek(0, fs)?;
@@ -184,7 +184,7 @@ impl GrainReader {
                 Self::fade_inner(
                     &mut self.tail,
                     &mut self.head,
-                    Some(wav),
+                    wav,
                     fs,
                 )?;
                 // always loop over len/loop_div steps **after** onset

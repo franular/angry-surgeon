@@ -111,14 +111,15 @@ fn main() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
     let audio_handle = std::thread::spawn(move || -> Result<()> {
-        let config = device.default_output_config().unwrap();
+        let config = device
+            .supported_output_configs()?
+            .find(|v| v.channels() == 2 && v.sample_format() == cpal::SampleFormat::F32)
+            .ok_or(color_eyre::Report::msg(
+                "failed to init desired audio output",
+            ))?;
+        let config = config.with_sample_rate(cpal::SampleRate(audio::SAMPLE_RATE));
         let handler = audio::SystemHandler::new(audio_rx).unwrap();
-
-        match config.sample_format() {
-            cpal::SampleFormat::I16 => play::<i16>(&device, &config.into(), handler)?,
-            cpal::SampleFormat::F32 => play::<f32>(&device, &config.into(), handler)?,
-            sample_format => panic!("unsupported sample format: {}", sample_format),
-        }
+        play::<f32>(&device, &config.into(), handler)?;
         Ok(())
     });
 
